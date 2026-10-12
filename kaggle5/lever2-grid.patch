@@ -1,0 +1,109 @@
+diff --git a/ARC3-Inference/README.md b/ARC3-Inference/README.md
+index 3674ea5..9a9e10f 100644
+--- a/ARC3-Inference/README.md
++++ b/ARC3-Inference/README.md
+@@ -83,7 +83,7 @@ plan, and execute real game actions with `action(...)`.
+ 
+ | Name | Meaning |
+ | --- | --- |
+-| `current_frame` | Latest board, exposing `.ascii`, `.segmentation`, `.shape`, `.step`, and `.level`. `.shape` is `(rows, cols)`. |
++| `current_frame` | Latest board, exposing `.ascii`, `.grid`, `.segmentation`, `.shape`, `.step`, and `.level`. `.shape` is `(rows, cols)`; `.grid[row][col]` is the numeric color ID at that cell. |
+ | `previous_frame` | Board before the most recent recorded action, when available. |
+ | `history` | Recorded states and actions. `history[-1].frame` is the current, post-action board. |
+ | `transitions` | Individual executed actions, each with `.action`, `.before_frame`, `.after_frame`, and retained `.result` metadata. |
+@@ -94,8 +94,10 @@ plan, and execute real game actions with `action(...)`.
+ 
+ Segmentation uses same-color, 4-connected components. Components and their
+ cross-frame matches are geometric descriptions, not guaranteed game-object
+-identities. The raw numeric grid is not exposed; `.ascii` provides the symbolic
+-grid and `.segmentation` provides objects, boundaries, containment, and adjacency.
++identities. `.grid` is an immutable tuple of numeric color-ID rows for exact
++cell-level checks; `.ascii` provides a symbolic view and `.segmentation` provides
++objects, boundaries, containment, and adjacency. Prefer compact computed
++summaries to printing an entire grid.
+ 
+ `action(...)` returns `last_action_call_result` and refreshes the provided
+ runtime state before the next Python statement. Inspection-only calls retain
+diff --git a/ARC3-Inference/inference/agent/prompts.py b/ARC3-Inference/inference/agent/prompts.py
+index 52351db..3053e65 100644
+--- a/ARC3-Inference/inference/agent/prompts.py
++++ b/ARC3-Inference/inference/agent/prompts.py
+@@ -130,7 +130,7 @@ GAMEPLAY_CHANGED_ADDENDUM = (
+ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
+     "\n\nRuntime variables inside every `python` tool call:\n"
+     "- `current_frame` is a lightweight frame view for the latest environment state.\n"
+-    "- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.\n"
++    "- `current_frame` exposes `.ascii`, `.step`, `.level`, `.shape`, `.grid`, and `.segmentation`.\n"
+     "- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.\n"
+     "- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.\n"
+     "- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores position AND rotation -- equal hashes indicate matching color and shape up to rotation; they do not establish object identity), `rotation` (degrees clockwise from the object's canonical orientation: 0/90/180/270, reduced to 0/90 for 2-fold symmetric shapes, `None` for fully symmetric ones), `rotational_symmetry` (1, 2, or 4), `pose_hash` (the rotation-SENSITIVE variant, if you need to match exact orientation), `shape_hash` (color-independent pose shape signature), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]` cell coordinates), and `children` (ids of objects fully enclosed by this one).\n"
+@@ -139,12 +139,12 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
+     "- `current_frame.step` is the current environment step count.\n"
+     "- `current_frame.level` is the current level number.\n"
+     "- `current_frame.shape` is a `(rows, cols)` tuple.\n"
+-    "- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
++    "- `current_frame.grid` is the exact numeric color grid, indexed as `grid[row][col]`, returned as an immutable tuple of row tuples. Use it for exact cell/color tests and custom scans; use `current_frame.segmentation` for object summaries and relationships, and `.ascii` for small human-readable regions. Prefer compact computed results over printing the whole grid.\n"
+ 
+     "- `history` is a chronological list of action/frame snapshots.\n"
+     "- `history` is a Python list of objects, not a dict.\n"
+     "- Each history entry exposes `.action`, `.frame`, and `.result`; entries are not subscriptable like `entry['action']`.\n"
+-    "- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.\n"
++    "- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes `.ascii`, `.step`, `.level`, `.shape`, `.grid`, and `.segmentation`.\n"
+     "- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.\n"
+     "- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.\n"
+     "- `last_action` is the most recent real environment action name/display, or `None` before any real action.\n"
+diff --git a/ARC3-Inference/inference/agent/python_tool_sandbox.py b/ARC3-Inference/inference/agent/python_tool_sandbox.py
+index 58a94b3..71f7172 100644
+--- a/ARC3-Inference/inference/agent/python_tool_sandbox.py
++++ b/ARC3-Inference/inference/agent/python_tool_sandbox.py
+@@ -164,8 +164,16 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+             self.level = level
+             self.shape = tuple(shape)
+             self._grid = grid
++            self._grid_view = None
+             self._segmentation = None
+ 
++        @property
++        def grid(self):
++            # Cache an immutable snapshot so callers cannot mutate the frame.
++            if self._grid_view is None:
++                self._grid_view = tuple(tuple(row) for row in self._grid)
++            return self._grid_view
++
+         @property
+         def segmentation(self):
+             if self._segmentation is None:
+@@ -174,7 +182,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+ 
+         def __str__(self):
+             rows, cols = self.shape
+-            return f"AsciiFrameView(level={self.level}, step={self.step}, shape={rows}x{cols})"
++            return f"FrameView(level={self.level}, step={self.step}, shape={rows}x{cols})"
+ 
+         __repr__ = __str__
+ 
+diff --git a/ARC3-Inference/inference/agent/tool_agent.py b/ARC3-Inference/inference/agent/tool_agent.py
+index 84a9cdd..6b21669 100644
+--- a/ARC3-Inference/inference/agent/tool_agent.py
++++ b/ARC3-Inference/inference/agent/tool_agent.py
+@@ -295,16 +295,16 @@ _DIFF_IMAGE = _get_env_bool("ARC3_DIFF_IMAGE", False)
+ _RESPONSE_META_MAX_CHARS = 4000
+ 
+ _PYTHON_TOOL_DESCRIPTION = (
+-    "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
++    "Run one ephemeral Python snippet against preloaded board state. Available globals: "
+     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
+     "`valid_actions`, `last_action_call_result`, "
+     "and `action(actions)` for executing one or more real environment actions. "
+-    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
++    "`current_frame` and each `history[*].frame` expose `.ascii`, `.grid` (an immutable tuple of numeric color IDs by row and column), `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
+     "`history[-1].frame` is the current post-action frame, not the previous frame. "
+     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
+     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
+-    "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
+-    "Use `print(...)` for compact output or assign final data to `result`."
++    "Use `.grid` for exact cell-level tests, `.segmentation` for object summaries, and `.ascii` for small human-readable regions. "
++    "Use `print(...)` for compact output or assign final data to `result`; avoid printing the whole grid when a summary will do."
+ )
+ 
+ def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
