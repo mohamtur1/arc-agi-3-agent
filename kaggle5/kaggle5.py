@@ -422,6 +422,29 @@ def is_empty_code_cell(cell: dict) -> bool:
     return not src and not outputs
 
 
+def is_misclassified_markdown(cell: dict) -> bool:
+    if cell.get("cell_type") != "code":
+        return False
+    src = cell_text(cell).strip()
+    if not src:
+        return False
+    if src.startswith("%%") or "writefile" in src or "_K5" in src or LEVER_TAG in src:
+        return False
+    lines = [l.strip() for l in src.splitlines() if l.strip()]
+    if not lines:
+        return False
+    first = lines[0]
+    is_md_header = first.startswith(("# ", "## ", "### ", "**", "- "))
+    has_bold_or_update = any(l.startswith(("**", "* ", "- ", "> ")) or "update (v" in l.lower() for l in lines)
+    if not (is_md_header and has_bold_or_update):
+        return False
+    try:
+        compile(src, "<cell>", "exec")
+        return False
+    except SyntaxError:
+        return True
+
+
 def sanitize_notebook(nb: dict) -> dict:
     nb = json.loads(json.dumps(nb))
     cells = nb.get("cells", [])
@@ -433,6 +456,11 @@ def sanitize_notebook(nb: dict) -> dict:
         elif is_hand_lever_cell(c):
             say("  [sanitizer] removed hand lever-2 prototype cell at index %d" % i)
             drop.add(i)
+        elif is_misclassified_markdown(c):
+            say("  [sanitizer] converted misclassified markdown cell at index %d to markdown" % i)
+            c["cell_type"] = "markdown"
+            c.pop("execution_count", None)
+            c.pop("outputs", None)
     if drop:
         nb["cells"] = [c for i, c in enumerate(cells) if i not in drop]
     return nb
@@ -1673,15 +1701,25 @@ def do_daily(work: Path, patch_path: Path, applier_path: Path,
     # ---- 2) hold / stale window for an unanswered pending row ----
     pend = view.open_pending()
     if pend is not None:
-        say("")
-        say("--- pending row %s (%s) is unanswered ---" % (pend["exp"], pend["variant"]))
-        say("  pushed as version v%s on %s; no completed submission matched it yet."
-            % (pend.get("version"), pend.get("date")))
-        say("  Either the human has not submitted (your move — see the card in")
-        say("  that day's run log) or scoring is still in flight. The driver")
-        say("  pushes nothing today, on purpose.")
-        led.sync_out("daily %s: holding on %s" % (today, pend["exp"]))
-        return
+        st = kernel_status()
+        if st in ("error", "failed"):
+            say("")
+            say("  pushed kernel version failed on Kaggle (status %r) — cannot be submitted." % st)
+            say("  auto-abandoning %s to unblock re-planning." % pend["exp"])
+            led.append({"kind": "abandon", "exp": pend["exp"],
+                        "reason": "kernel run failed on Kaggle (status %s)" % st})
+            led.sync_out("abandon %s (kernel failed)" % pend["exp"])
+            view = led.fold()
+        else:
+            say("")
+            say("--- pending row %s (%s) is unanswered ---" % (pend["exp"], pend["variant"]))
+            say("  pushed as version v%s on %s; no completed submission matched it yet."
+                % (pend.get("version"), pend.get("date")))
+            say("  Either the human has not submitted (your move — see the card in")
+            say("  that day's run log) or scoring is still in flight. The driver")
+            say("  pushes nothing today, on purpose.")
+            led.sync_out("daily %s: holding on %s" % (today, pend["exp"]))
+            return
 
     # ---- 3) plan ----
     say("")
