@@ -32,6 +32,8 @@ NB_HEADINGS = [
     "## 4. Import the bundled source",
     "## 5. Start serving",
     "## 6. Load the benchmark",
+    "## 7. Customization hook",
+    "## 8. Run the system monitor",
 ]
 
 META = {
@@ -88,6 +90,16 @@ def notebook():
             # driver's knob-channel scan sees what a v4-bearing fork shows.
             body = ("# the bundled agent reads overrides from K5_KNOBS_JSON (K1)\n"
                     "print('import bundled source')\n")
+        elif h.startswith("## 7."):
+            body = ("# Make one-off changes to bm, bm.games, or bm.solver here before the run starts.\n"
+                    "class _Solver:\n"
+                    "    analyzer_timeout = 900.0\n"
+                    "    max_runtime_s_per_game = 31920.0\n"
+                    "    max_actions_per_game = None\n"
+                    "    concurrency = 120\n"
+                    "class _BM:\n"
+                    "    solver = _Solver()\n"
+                    "bm = _BM()\n")
         else:
             body = "print(%r)\n" % h
         cells.append({"cell_type": "code", "metadata": {}, "execution_count": None,
@@ -121,7 +133,7 @@ def main():
         s["version"] += 1
         s["status"] = "running"
         s["pushed"] = {"cells": len(nb["cells"]),
-                       "has_knob_payload": any("_K5 = {" in t for t in texts),
+                       "has_knob_payload": any("_K5 = {" in t or "_K5 =" in t for t in texts),
                        "sources": json.loads((p / "kernel-metadata.json").read_text())}
         save(s)
         print("Kernel version %d successfully pushed.  Please check progress at https://www.kaggle.com/code/x"

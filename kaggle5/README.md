@@ -1,232 +1,144 @@
-# kaggle5 — the between-game learning loop
+# kaggle5 — the between-game learning loop (v5: harness epoch)
 
-The agent already learns *within* a game. This folder makes it learn *between*
-games: one deterministic, knob-at-a-time experiment per day, measured, and
-written into an append-only ledger that explains every decision months later.
+This folder drives the between-game learning loop for the Kaggle competition
+**ARC Prize 2026 — ARC-AGI-3** (`arc-prize-2026-arc-agi-3`). A scheduled CPU
+Kaggle notebook ("K5") drives the GPU competition kernel purely through the
+Kaggle CLI, running one deterministic one-knob experiment per day, recorded
+in an append-only ledger.
 
-**The machine never submits.** It pushes the GPU kernel, prints a card naming
-the variant, the knob changed, and the reason — and stops. A human spends the
-daily slot in the Kaggle app, exactly like the first two submissions.
+**THE MACHINE NEVER SUBMITS.** It pushes a kernel version, prints a "human card"
+(variant, knob changed, reason, version number, three taps), and stops. The
+user spends the daily slot in the Kaggle app and pastes the message
+`kaggle5 <variant> v<N>` so tomorrow's reconcile matches the score to the
+experiment with certainty (FIFO-by-date is the fallback). This rule is absolute
+and is itself self-tested.
 
 Lives in `mohamtur1/arc-agi-3-agent/kaggle5/`.
 
 ```
 kaggle5/
-├── kaggle5.py                the driver. The only file that calls `kaggle`.
-│                             Also: ledger, reconciler, planner, gym gate.
-├── program_synthesis_agent_v4.py   the agent. v3 + the K1 knob channel + K2
-│                             telemetry. Identical behaviour to v3 when no
-│                             knob file is present (trace-verified). The
-│                             source of truth is 4CBOn2/Kaggle/; this mirror
-│                             is what build_notebook.py embeds, pinned by
-│                             AGENT_SHA256 inside kaggle5.py.
-├── k5_gym.py                 the local filter: five deterministic toy games.
-│                             A smoke filter, NEVER a leaderboard score.
-├── lever2-grid.patch         THE LEVER. A fixed artifact (pinned by sha256).
-├── lever2_apply.py           applies it and hash-verifies all 4 hunks.
-├── build_notebook.py         regenerates the notebook from the five above
-├── 4CBOn2_Kaggle5.ipynb      generated. Paste into Kaggle once.
-└── _stub_kaggle.py           CLI test double, for offline tests
+├── kaggle5.py                    the driver. The only file that calls `kaggle`.
+│                                 Also: ledger, reconciler, planner, static gate.
+├── program_synthesis_agent_v4.py FROZEN lineage: pinned (AGENT_SHA256) mirror
+│                                 of the v4 agent from 4CBOn2/Kaggle/. Delivered
+│                                 and pinned but NEVER wired into the live kernel.
+├── k5_gym.py                     FROZEN lineage: local toy filter gym. Never
+│                                 runs in v5 (harness has no local proxy).
+├── lever2-grid.patch             THE LEVER. Pinned fixed artifact (sha256).
+├── lever2_apply.py               applier (applies and hash-verifies all 4 hunks).
+├── build_notebook.py             notebook generator (preflight self-test gates build).
+├── 4CBOn2_Kaggle5.ipynb          generated deliverable to import into Kaggle.
+└── _stub_kaggle.py               Kaggle CLI test double for offline tests.
 ```
 
-The notebook is a generated artifact. Edit the sources, run
-`build_notebook.py`, push to git. At run time the notebook re-fetches every
-file from the repos (with loud per-file hashes) and only falls back to its
-embedded byte-verified copies on failure — loudly.
+## The Architecture Decision
 
-## A day in the loop
+The device k5 serves is the **Franzen LLM-harness kernel**:
+`mohamedmalikturay/arc-agi-3-milestone-2-solution-3e9adb`
+(dfranzen's benchmark fork + the lever layer).
 
-1. **pull the ledger** — `datasets download` of `mohamedmalikturay/kaggle5-ledger`
-   (auto-created on first use, private). Local copy + remote are line-merged;
-   append-only, so merging is a union.
-2. **reconcile** — read yesterday's submission(s) back: aggregate from
-   `competitions submissions`, per-game rows from `kernels output <v>` (the
-   v4 agent writes `k5_per_game.csv` + a self-report during the rerun).
-   Matched to the pending row by the message the human pastes
-   (`kaggle5 <variant> v<N>`), falling back to FIFO-by-date. Absent, zero,
-   and errored submissions are all recorded as data. Interactive-run DUMMY
-   artifacts (single hardcoded row) are labelled `dummy`, never folded in.
-3. **plan** — fold the ledger, walk the fixed queue (below), one knob at a
-   time, with the documented backtrack rule. The reason is written into the
-   pending row.
-4. **filter** — run `k5_gym.py`: incumbent vs candidate on five toy games.
-   Only the obviously-broken fail (crash / hang / lost toy win / 2+ toy
-   levels). Filter counters are stored in the ledger under `local_filter`,
-   permanently labelled NOT a score.
-5. **pending row** — written and synced BEFORE the push, so a crash can
-   never lose what today was supposed to measure.
-6. **push + stop** — inject the lever cells plus the `k5_knobs.json` writer
-   cell (the K1 channel), push, print the human card. Exit.
+The older MyAgent program-synthesis lineage is **FROZEN** as published work
+in the repos — files `program_synthesis_agent_v4.py` (pinned `AGENT_SHA256`
+`8f447e454134d4a55dd0dfe3227c6273fa70c595f24773a0c6c84e1ce7b440a0`), `k5_gym.py`,
+and the Kaggle4 notebooks. They are delivered and pinned but **NEVER** wired into
+the live kernel; the toy gym never runs in v5. The earlier "paste v4 agent
+into the fork" step is a documented DEAD END — do not resurrect it (the live
+kernel is an LLM tool-agent; a pasted v4 cell would execute nothing while
+unlocking inert knob pushes — exactly what the design protects against).
 
-Interrupted anywhere, the next run resumes from the ledger. `daily` is
-idempotent within a day: an unanswered pending row means "print the card
-state and push nothing".
+## Knob Surface & Baselines
 
-### Your three taps after a push notification
+Exactly four `bm.solver` attributes (baselines are the submission-effective values):
 
-1. open https://www.kaggle.com/code/mohamedmalikturay/arc-agi-3-milestone-2-solution-3e9adb
-2. wait for the pushed version to finish, then `...` → **Submit to
-   arc-prize-2026-arc-agi-3** → pick the pushed version
-3. paste the message the card prints (`kaggle5 <variant> v<N>`) — that's how
-   the next run matches the score to the experiment with certainty (FIFO by
-   date is the fallback)
-
-Skip a day: the driver waits ~2 days, tombstones the row `stale` (never
-silently drops it), and moves on. Skip deliberately: `python kaggle5.py
---abandon`.
-
-## The one-time step (do this once, in the app)
-
-The knob channel only exists in v4. **Paste `program_synthesis_agent_v4.py`
-into the fork**, replacing the v3 agent, and save a version. Until you do,
-`check` will report `K1 channel: NO`, and any knob-changing push is REFUSED
-(inert variants would burn a day for zero information — the refusal text says
-this too). v4 with no knob file is behaviour-identical to v3, so this swap
-changes nothing until the first experiment arrives.
-
-Also upload `program_synthesis_agent_v4.py` to `4CBOn2/Kaggle/` — that repo
-is the source of truth; the mirror here is pinned (`AGENT_SHA256`).
-
-## The ledger
-
-Two append-only JSON-lines files, synced to the private dataset
-`mohamedmalikturay/kaggle5-ledger` at the start and end of every run and once
-more pre-push:
-
-- `experiments.jsonl` — experiment rows (`kind: experiment`) carry date,
-  variant, `changed: {knob: [old, new]}`, the FULL 10-knob state, the agent
-  file name + sha256, and the one-line reason. Life events are separate
-  appended rows: `pushed`, `score` (with `ref`, `incumbent_score_before`,
-  `verdict`, `adopted`), `gym` (filter), `stale`, `abandon`, `import`.
-- `game_rows.jsonl` — the per-game telemetry rows for scored experiments,
-  with provenance (`source: kernel_output`, `version`) and the `dummy` label.
-
-Nothing is ever rewritten; fold logic derives the current picture. If the
-dataset path fails, the driver tries a GitHub commit (only when
-`K5_GITHUB_TOKEN`/`GITHUB_TOKEN` was deliberately set) and otherwise prints a
-loud rescue block. It never pretends a sync succeeded.
-
-Seeded once into an empty ledger: `v1-imported 0.06`, `v2-imported 0.07`
-(hashes unrecorded at the time — which is why the ledger exists).
-
-## The experiment queue
-
-Fixed order, one knob at a time. Ladder entries are tried in order;
-EQUAL-OR-BETTER adopts the value and continues the ladder; WORSE reverts and
-kills the rest of that knob's ladder (knob declared settled). Ranges were
-chosen by reading the code that consumes each knob:
-
-| # | knob | ladder | why (code-grounded) |
+| knob | type | baseline | role |
 |---|---|---|---|
-| 1 | EXPLORATION_CAP | 24, 6 | up first: more graph novelty before the bounded rotation (`_no_signal_explore`) |
-| 2 | GRAPH_HASH_STRIDE | 2, 8 | down first: 32x32 vs 16x16 hash lattice, finer state identity |
-| 3 | PROBE_ATTEMPT_CAP | 2, 5 | down first: every probe is a burned action in move games |
-| 4 | GRAPH_RECENT_CAP | 1 | the on/off A/B: `is_revert` reads `recent[-2]` EXCLUSIVELY, so 6/12/24 are provably identical — the only real alternative is OFF (cap 1) |
-| 5 | REPLAY_ABORT_STALE | 3, 1 | up first: trust stored wins one abort longer |
-| 6 | SEQ_STORE_CAP | 80, 40 | up first: 80 == MAX_ACTIONS, so no win is truncated from replay |
-| 7 | BLACKLIST_CAP | 128, 32 | up first: eviction is an unordered `set.pop()`; 128 mostly ends thrash |
-| 8 | GLOBAL_CHANGE_FRACTION | 0.15, 0.05 | down only: `n > FRAC*4096 or n > 1024` clamps the fraction term at 0.25, so upward sweeps are provably inert and were removed |
-| 9 | CLICK_SELECTORS | swap probe | one adjacent swap of the hypothesis priority order |
+| `analyzer_timeout` | float+ | 900.0 | Per-game timeout for code analysis |
+| `max_runtime_s_per_game` | float+ | 31920.0 | Notebook runtime budget per game (532*60) |
+| `max_actions_per_game` | int\|null | None | Cap on total agent action steps |
+| `concurrency` | int+ | 120 | Parallel solver workers |
 
-`GRID`/`CELL` are structural and permanently off the list. When the queue is
-exhausted the driver prints the incumbent and pushes nothing, ever — the loop
-stops by design rather than inventing experiments.
+Day 1 is the **ANCHOR**: full surface at baselines, pushed and measured, so the
+ledger binds to this kernel's own bytes (variant name `franzen-base`, device
+`franzen-harness-v1`).
 
-## Honest expectations (the ceiling)
+## The Fixed Experiment Queue
 
-This system measures; it does not compound. Knob experiments are expected to
-find small deltas in the 0.06–0.07 regime, and some will be worse — a worse
-number is still one clean data point, because the agent is deterministic. The
-0.06 → 0.07 step came from a hand-written architectural change, not from
-sweeping. What you are buying here is one trustworthy measurement per day, a
-per-game map of what each knob touches, and a ledger that explains itself.
-The same machinery can later drive targeted v5 architectural experiments —
-the knob JSON is just the first payload — but nobody should expect daily
-compounding from constants.
+One unmeasured step per knob, respecting the static gate's `|log2(new/old)| <= 1`
+clamp:
 
-## Guards
+1. `analyzer_timeout`: `900.0 -> 1200.0` (up: 33% more time for analyzer)
+2. `max_actions_per_game`: `None -> 500` (capping the uncapped side)
+3. `max_runtime_s_per_game`: `31920.0 -> 31320.0` (~2% trim, 10m buffer)
+4. `concurrency`: `120 -> 60` (down: reduce contention / memory pressure)
 
-`push` refuses when: any of the 5 inputs is missing from the pulled metadata;
-internet is on; the heading anchor is missing; `WORKING_DIR`/`BUNDLE_DIR` are
-not defined above the injection point; the post-injection re-read fails
-(patch + applier [+ knobs] cells, payload round-trips); the notebook was
-already identical (no `--allow-same`); the agent file's sha256 differs from
-the `AGENT_SHA256` pin; `DEFAULT_KNOBS` drifted from the agent module; or a
-knob experiment would be inert (no K1 channel in the fork) without
-`--allow-inert`. Every run starts by probing every CLI subcommand + flag the
-driver relies on against the installed CLI (bug-D rule: no inherited flag
-assumptions).
+Backtrack rule: WORSE reverts and kills that knob's ladder; EQUAL adopts and continues.
 
-`check` additionally prints the pulled notebook map, whether the K1 channel
-is present, and a best-effort `submission-limits` probe (informational only).
+## Knob Channel Topology & Sanitizer
 
-## Stages
+- **Topology**: The driver injects ONE self-contained knob cell immediately
+  after the kernel's `## 7. Customization hook` markdown heading (after the hook's
+  code cell, before the next heading). The cell carries its own surface map in
+  the payload (format 2), applies assignments allowlist-only, loudly refuses
+  unknown names / uncaps / bools, dies if the upstream harness renamed an
+  attribute, prints `[k5] bm.solver.x: old -> new` per knob, and writes
+  `/kaggle/working/k5_knobs.json`.
+- **Push refusal predicate**: `has_knob_channel = "K5_KNOBS_JSON" marker present OR hook heading found`.
+  If neither, knob pushes die with the fix explained.
+- **Sanitizer**: Runs at every push (loud): removes hand lever-2 prototype cells
+  (inline monkeypatch edits) and empty output-less code cells; the canonical
+  hash-verified lever pair replaces them. Lever pair = `%%writefile lever2-grid.patch`
+  cell + applier cell (`lever2_apply.py` applies and hash-verifies all 4 hunks;
+  patch pinned sha256 `143ae716d99374cccbe6f25b607c3f6bf6e2eb9fa50299b9a05ff5e3cfd09b69`).
 
+## Static Gate
+
+The static gate is **RULES ONLY**:
+- Exactly one knob changed
+- Knob in surface (`KNOB_SURFACE`)
+- No booleans
+- Never uncap (`None -> value` allowed, `value -> None` refused)
+- `|log2(new/old)| <= 1` for positive numerics
+- Canon-equal refused
+
+**THE HARNESS HAS NO LOCAL PROXY** (wallet-budget LLM solver, 9h GPU run) — the
+frozen toy gym said nothing about it. Filter results are never presented as
+predictions or scores.
+
+## A Day in the Loop
+
+1. **pull the ledger** — `datasets download` of private dataset `mohamedmalikturay/kaggle5-ledger`
+   (line-merged union).
+2. **reconcile** — match yesterday's submission (message match `kaggle5 <variant> v<N>`,
+   FIFO fallback; zero/error/absent all recorded as data; dummy rows labelled).
+3. **plan** — fixed queue + documented backtrack.
+4. **static gate** — rules check.
+5. **pending row** — written and synced BEFORE the push (durable).
+6. **push** — push the GPU kernel, print the human card, **and stop**.
+
+## Your Three Taps After a Push
+
+1. Open https://www.kaggle.com/code/mohamedmalikturay/arc-agi-3-milestone-2-solution-3e9adb
+2. Wait for the pushed version to finish running, then `...` → **Submit to
+   arc-prize-2026-arc-agi-3** → pick the pushed version.
+3. Paste the message printed on the card: `kaggle5 <variant> v<N>`.
+
+Skip a day: waits ~2 days, marks `stale`, moves on.
+Deliberate skip: `python kaggle5.py --abandon`.
+
+## Ledger
+
+Append-only `experiments.jsonl` + `game_rows.jsonl`. Pending rows carry full
+surface state + device (`franzen-harness-v1`). If dataset path fails, tries
+GitHub commit (only with deliberately set `K5_GITHUB_TOKEN`) else prints loud
+rescue block; never pretends a sync succeeded.
+Seeded history: `v1-imported 0.06`, `v2-imported 0.07`.
+
+## Self-Test
+
+```bash
+python3 kaggle5.py --self-test
 ```
-python kaggle5.py --stage check    # free dry run after probes
-python kaggle5.py --stage plan     # reconcile + print today's plan (read-only)
-python kaggle5.py --stage gym --set EXPLORATION_CAP=20   # ad-hoc toy filter
-python kaggle5.py --stage push [--set KNOB=JSON]         # manual push
-python kaggle5.py --stage score    # reconcile + experiment table
-python kaggle5.py --stage daily    # the scheduled loop
-python kaggle5.py --abandon        # tombstone the pending row
-python kaggle5.py --self-test      # everything below, offline
-python kaggle5.py --stage submit   # refuses loudly, exit 1 (as does `all`)
-```
-
-## Auth
-
-`KAGGLE_API_TOKEN`, then `KAGGLE_API_V1_TOKEN` (what Kaggle injects; the
-notebook maps it into the modern name), then `~/.kaggle/access_token[.txt]` /
-`~/.kaggle/kaggle.json`, then `KAGGLE_USERNAME`+`KAGGLE_KEY`, then a
-TTY-guarded prompt (interactive only), and finally Kaggle's ambient notebook
-auth. No path may abort a scheduled run (bug-A rule).
-
-## Tests
-
-```
-python kaggle5.py --self-test
-```
-
-Offline, no auth, no network. Covers: injection surgery (lever-only and
-lever+knobs, idempotent replace); the ledger (append-only, fold, full-knob +
-hash reproducibility of pending rows); reconcile (message match, FIFO
-fallback, idempotency, zero and error recorded as data, stale tombstones,
-dummy labelling); the planner (anchor first, queue order, worse-kills-ladder
-backtrack, exhaustion); the guards and the submit/all refusals; and a full
-multi-day simulation against `_stub_kaggle.py` (anchor → exp-001 → worse →
-backtrack → same-day hold), which also asserts **zero** `competitions submit`
-calls across the whole simulated week and that per-game rows landed.
-
-To drive stage functions against the stub by hand:
-
-```
-KAGGLE_BIN="python3 $PWD/_stub_kaggle.py" K5_TODAY=2026-10-15 \
-    python kaggle5.py --stage daily --work /tmp/w
-```
-
-`KAGGLE_BIN` overrides the CLI path; `K5_TODAY` overrides the local date
-(testing hook, also documented in the driver).
-
-## CLI version
-
-Verified live against Kaggle CLI **2.2.4** (an earlier note that claimed
-2.0.2 was wrong): `kernels pull/push/status/files/output`,
-`competitions submissions (--format json --page-size)`,
-`competitions submission-limits (--json)` (it exists), and
-`datasets download/create/version` (`-t` so .jsonl files are not "converted";
-create is private by default; metadata file is `datasets-metadata.json`).
-The probe re-verifies all of this every run, so a future CLI bump fails
-loudly at the flag that changed instead of silently misreading output.
-
-## After editing
-
-```
-python build_notebook.py
-```
-
-Runs `--self-test` first and refuses to build if it fails; pins the lever
-patch by sha256; mirrors + pins the agent (`K5_AGENT_SRC=/path` for offline
-builds); then verifies the notebook re-parses, is CPU-only with internet on,
-and that all five embedded fallbacks are byte-identical to their sources.
-Bug-A and bug-B regression assertions are part of the verify step.
+Offline, no auth, no network. Exercises injection surgery, hook placement,
+payload AST round-trip, idempotent replace, sanitizer, refusal on missing hook,
+ledger, reconcile, planner, static gate edge cases, guards, and multi-day
+simulation against `_stub_kaggle.py` asserting **zero** `competitions submit` calls.

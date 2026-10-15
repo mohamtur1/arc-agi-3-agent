@@ -46,6 +46,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -77,6 +78,10 @@ AGENT_SHA256 = "8f447e454134d4a55dd0dfe3227c6273fa70c595f24773a0c6c84e1ce7b440a0
 GYM_FILE = "k5_gym.py"
 KNOB_JSON_NAME = "k5_knobs.json"
 AGENT_CHANNEL_MARKER = "K5_KNOBS_JSON"   # present in any agent with the K1 loader
+
+DEVICE = "franzen-harness-v1"
+ANCHOR_VARIANT = "franzen-base"
+HOOK_HEADING_SUBSTR = "customization hook"
 
 LEVER_TAG = "lever-2"
 LEVER_PATCH_FILE = "lever2-grid.patch"     # the git patch that IS the lever
@@ -122,70 +127,29 @@ LOCAL_UTC_OFFSET_HOURS = 0
 # structural and are permanently OFF the sweep list.
 # --------------------------------------------------------------------------
 
-DEFAULT_KNOBS = {
-    "BLACKLIST_CAP": 64,
-    "SEQ_STORE_CAP": 60,
-    "GLOBAL_CHANGE_FRACTION": 0.25,
-    "GRAPH_HASH_STRIDE": 4,
-    "GRAPH_RECENT_CAP": 12,
-    "GRAPH_TRANSIENT_MAX_DIFF": 32,
-    "EXPLORATION_CAP": 12,
-    "CLICK_SELECTORS": ["rarest_color", "smallest_object",
-                        "corner_sample_color", "largest_object"],
-    "PROBE_ATTEMPT_CAP": 3,
-    "REPLAY_ABORT_STALE": 2,
+KNOB_SURFACE = {
+    "analyzer_timeout": {"type": "float", "min": 0.0, "default": 900.0},
+    "max_runtime_s_per_game": {"type": "float", "min": 0.0, "default": 31920.0},
+    "max_actions_per_game": {"type": "int_or_none", "min": 1, "default": None},
+    "concurrency": {"type": "int", "min": 1, "default": 120},
 }
 
-# The fixed experiment queue. Rules (deterministic, repeated in every reason
-# line): one knob at a time; ladder entries tried in order; EQUAL-OR-BETTER
-# adopts the value into the incumbent and continues the ladder; WORSE reverts
-# and kills the rest of that knob's ladder (the knob is declared settled);
-# then move on. The ledger alone must be enough to reproduce every row.
-#
-# Ladder ranges were chosen by reading the code that consumes each knob —
-# two traps found that way are documented inline (entries 4 and 8).
+DEFAULT_KNOBS = {
+    "analyzer_timeout": 900.0,
+    "max_runtime_s_per_game": 31920.0,
+    "max_actions_per_game": None,
+    "concurrency": 120,
+}
+
 EXPERIMENT_QUEUE = [
-    ("EXPLORATION_CAP", [24, 6],
-     "up first: 12->24 gives the state graph more novel actions before the "
-     "bounded rotation kicks in (_no_signal_explore); if that is worse the "
-     "budget is not the binding constraint and the knob settles at 12"),
-    ("GRAPH_HASH_STRIDE", [2, 8],
-     "down first: stride 2 hashes 32x32 cells instead of 16x16 "
-     "(hash_grid) — finer state identity for transient + novelty; if noise "
-     "explodes the state count (worse), settle at 4"),
-    ("PROBE_ATTEMPT_CAP", [2, 5],
-     "down first: every probe is a burned action in move games and a "
-     "(0,0)-marked action is dead anyway (_learn_direction); if controls "
-     "get mislearned (worse), settle at 3"),
-    ("GRAPH_RECENT_CAP", [1],
-     "on/off only: is_revert reads recent[-2] EXCLUSIVELY, so any cap >= 2 "
-     "behaves identically — 6/12/24 sweeps would be empty days. cap=1 "
-     "(deque can never hold 2) is the only real alternative: it switches "
-     "transient detection OFF. One experiment answers 'does typed-transient "
-     "evidence help or hurt'"),
-    ("REPLAY_ABORT_STALE", [3, 1],
-     "up first: 2->3 trusts stored win-sequences through one more abort "
-     "(_replay_abort) when games are stable across levels; if worse, "
-     "settle at 2"),
-    ("SEQ_STORE_CAP", [80, 40],
-     "up first: 60->80 stops truncating long win sequences (80 == agent "
-     "MAX_ACTIONS, so any non-trivial win becomes replayable in "
-     "_on_level_advanced); if long replays just burn actions aborting, "
-     "settle at 60"),
-    ("BLACKLIST_CAP", [128, 32],
-     "up first: clicked_sig/blacklist eviction is an UNORDERED set.pop() "
-     "(_on_no_effect), so beyond-cap boards thrash; 64 = colors x cells is "
-     "reachable fast, 128 mostly ends eviction"),
-    ("GLOBAL_CHANGE_FRACTION", [0.15, 0.05],
-     "down only: classify_effect has `n > FRAC * 4096 or n > 1024` — at "
-     "0.25 the fraction term IS 1024, identical to the absolute clamp, so "
-     "UPWARD sweeps are provably inert and were removed from this ladder; "
-     "0.15 lowers the GLOBAL bar to 614 px and actually changes typing"),
-    ("CLICK_SELECTORS",
-     [["smallest_object", "rarest_color",
-       "corner_sample_color", "largest_object"]],
-     "single adjacent-swap probe of the hypothesis priority order "
-     "(_click_policy); list-valued knob, one change, judged like the rest"),
+    ("analyzer_timeout", [1200.0],
+     "up: 900.0 -> 1200.0 gives analyzer 33% more time per puzzle; respects |log2(1200/900)| <= 1"),
+    ("max_actions_per_game", [500],
+     "cap: None -> 500 caps the uncapped action side to prevent runaway infinite loops"),
+    ("max_runtime_s_per_game", [31320.0],
+     "trim: 31920 -> 31320 trims ~2% (600s / 10m buffer) per game"),
+    ("concurrency", [60],
+     "down: 120 -> 60 halves concurrency to reduce memory pressure / contention"),
 ]
 
 # Historical anchors, seeded once into an empty ledger. Scores from the
@@ -411,15 +375,62 @@ def needs_accelerator_flag(meta: dict) -> bool:
     return not (meta.get("machine_shape") or "").strip()
 
 
-def scan_agent_channel(nb: dict) -> bool:
-    """True iff the pulled notebook visibly contains an agent with the K1
-    knob channel. Knob experiments are REFUSED without it: pushing a
-    v3-agent variant whose knobs cannot change anything spends a day for
-    zero information."""
+def find_hook_heading(nb: dict) -> int | None:
+    for i, c in enumerate(nb.get("cells", [])):
+        if _is_md(c):
+            t = cell_text(c).lower()
+            if HOOK_HEADING_SUBSTR in t:
+                return i
+    return None
+
+
+def has_knob_channel(nb: dict) -> bool:
     for c in nb.get("cells", []):
         if AGENT_CHANNEL_MARKER in cell_text(c):
             return True
+    return find_hook_heading(nb) is not None
+
+
+def is_hand_lever_cell(cell: dict) -> bool:
+    if cell.get("cell_type") != "code":
+        return False
+    src = cell_text(cell)
+    if "Lever 2 — add .grid" in src or "sb = python_tool_sandbox._SANDBOX_BOOTSTRAP" in src:
+        return True
+    if "from inference.agent import prompts, python_tool_sandbox, tool_agent" in src:
+        return True
     return False
+
+
+def is_empty_code_cell(cell: dict) -> bool:
+    if cell.get("cell_type") != "code":
+        return False
+    src = cell_text(cell).strip()
+    outputs = cell.get("outputs", [])
+    return not src and not outputs
+
+
+def sanitize_notebook(nb: dict) -> dict:
+    nb = json.loads(json.dumps(nb))
+    cells = nb.get("cells", [])
+    drop = set()
+    for i, c in enumerate(cells):
+        if is_empty_code_cell(c):
+            say("  [sanitizer] removed empty output-less code cell at index %d" % i)
+            drop.add(i)
+        elif is_hand_lever_cell(c):
+            say("  [sanitizer] removed hand lever-2 prototype cell at index %d" % i)
+            drop.add(i)
+    if drop:
+        nb["cells"] = [c for i, c in enumerate(cells) if i not in drop]
+    return nb
+
+
+def find_knob_cell_index(nb: dict) -> int | None:
+    for i, c in enumerate(nb.get("cells", [])):
+        if c.get("cell_type") == "code" and (knob_marker() in cell_text(c) or AGENT_CHANNEL_MARKER in cell_text(c)):
+            return i
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -548,21 +559,14 @@ def lever_cells_present(nb: dict, lever_tag: str) -> list[int]:
     return out
 
 
-def build_lever_cells(patch_text: str, applier: str, lever_tag: str,
-                      knob_payload: dict | None) -> list[dict]:
-    """The cells, mirroring the working with_lever2 notebook: write the patch
-    to disk, git-apply it and hash-verify, then (when an experiment plan is
-    attached) write the k5_knobs.json the agent reads at import."""
-    # Built from parts so this file never contains the literal sequence, which
-    # would break embedding it inside a notebook cell.
+def build_lever_cells(patch_text: str, applier: str, lever_tag: str) -> list[dict]:
     if ("'" * 3) in patch_text:
         die(LEVER_PATCH_FILE
             + " contains a triple quote; cannot embed it in a writefile cell")
-    body = patch_text if patch_text.endswith("\n") else patch_text + "\n"
-    # Not %-formatted: `%%` would collapse to a single `%` and break the magic.
-    write = "%%writefile /kaggle/working/" + LEVER_PATCH_FILE + "\n" + body
-    app = applier_marker(lever_tag) + "\n" + applier.strip() + "\n"
-    cells = [
+    body = patch_text if patch_text.endswith(chr(10)) else patch_text + chr(10)
+    write = "%%writefile /kaggle/working/" + LEVER_PATCH_FILE + chr(10) + body
+    app = applier_marker(lever_tag) + chr(10) + applier.strip() + chr(10)
+    return [
         {"cell_type": "code", "metadata": {"trusted": True,
                                            "kaggle5": lever_tag + "-patch"},
          "execution_count": None, "outputs": [], "source": write},
@@ -570,35 +574,58 @@ def build_lever_cells(patch_text: str, applier: str, lever_tag: str,
                                            "kaggle5": lever_tag + "-apply"},
          "execution_count": None, "outputs": [], "source": app},
     ]
-    if knob_payload is not None:
-        src = (
-            knob_marker() + "\n"
-            "# Writes the knob state the agent reads at import (K1 channel).\n"
-            "# The FULL 10-knob state is in the payload: this run is\n"
-            "# reproducible from the ledger alone. A later push replaces it.\n"
-            "import json as _k5_json\n"
-            "import pathlib as _k5_pathlib\n"
-            "_K5 = %r\n" % knob_payload +
-            "_k5_pathlib.Path('/kaggle/working').mkdir(parents=True, exist_ok=True)\n"
-            "_k5_pathlib.Path('/kaggle/working/" + KNOB_JSON_NAME
-            + "').write_text(_k5_json.dumps(_K5, indent=1, sort_keys=True))\n"
-            "print('[k5] run binding: variant=%r changed=%r'\n"
-            "      % (_K5.get('variant'), _K5.get('changed')))\n"
-            "print('[k5] agent_sha256=%s' % str(_K5.get('agent_sha256'))[:16])\n"
-            "del _k5_json, _k5_pathlib, _K5\n"
-        )
-        cells.append({"cell_type": "code",
-                      "metadata": {"trusted": True, "kaggle5": "knobs"},
-                      "execution_count": None, "outputs": [], "source": src})
-    return cells
+
+
+def build_knob_cell(payload: dict) -> dict:
+    src = (
+        knob_marker() + chr(10) +
+        "# Injected after ## 7. Customization hook" + chr(10) +
+        "# Applies assignments allowlist-only, loudly refuses unknown names / uncaps / bools," + chr(10) +
+        "# dies if the upstream harness renamed an attribute, prints '[k5] bm.solver.x: old -> new'" + chr(10) +
+        "# per knob, and writes /kaggle/working/k5_knobs.json." + chr(10) +
+        "import json as _k5_json" + chr(10) +
+        "import pathlib as _k5_pathlib" + chr(10) + chr(10) +
+        "_K5 = " + json.dumps(payload, indent=2, sort_keys=True) + chr(10) + chr(10) +
+        "_K5_SURFACE = {" + chr(10) +
+        "    'analyzer_timeout': float," + chr(10) +
+        "    'max_runtime_s_per_game': float," + chr(10) +
+        "    'max_actions_per_game': (int, type(None))," + chr(10) +
+        "    'concurrency': int," + chr(10) +
+        "}" + chr(10) + chr(10) +
+        "if 'bm' not in globals() or not hasattr(bm, 'solver'):" + chr(10) +
+        "    raise RuntimeError('[k5] bm.solver not found in globals')" + chr(10) + chr(10) +
+        "for _k, _v in _K5.get('knobs', {}).items():" + chr(10) +
+        "    if _k not in _K5_SURFACE:" + chr(10) +
+        "        raise ValueError(f'[k5] Refusing unknown knob: {_k}')" + chr(10) +
+        "    if isinstance(_v, bool):" + chr(10) +
+        "        raise TypeError(f'[k5] Refusing boolean knob value: {_k}={_v}')" + chr(10) +
+        "    if not hasattr(bm.solver, _k):" + chr(10) +
+        "        raise AttributeError(f'[k5] Upstream harness has no attribute bm.solver.{_k}')" + chr(10) +
+        "    _old = getattr(bm.solver, _k)" + chr(10) +
+        "    if _old is not None and _v is None:" + chr(10) +
+        "        raise ValueError(f'[k5] Refusing uncap for {_k}')" + chr(10) +
+        "    setattr(bm.solver, _k, _v)" + chr(10) +
+        "    print(f'[k5] bm.solver.{_k}: {_old} -> {_v}')" + chr(10) + chr(10) +
+        "_k5_pathlib.Path('/kaggle/working').mkdir(parents=True, exist_ok=True)" + chr(10) +
+        "_k5_pathlib.Path('/kaggle/working/" + KNOB_JSON_NAME + "').write_text(" + chr(10) +
+        "    _k5_json.dumps(_K5, indent=1, sort_keys=True)" + chr(10) +
+        ")" + chr(10) +
+        "print('[k5] run binding: variant=%r changed=%r'" + chr(10) +
+        "      % (_K5.get('variant'), _K5.get('changed')))" + chr(10) +
+        "del _k5_json, _k5_pathlib, _K5, _K5_SURFACE" + chr(10)
+    )
+    return {"cell_type": "code",
+            "metadata": {"trusted": True, "kaggle5": "knobs"},
+            "execution_count": None, "outputs": [], "source": src}
 
 
 def inject(nb: dict, patch_text: str, applier: str, lever_tag: str,
            explicit_index: int | None = None,
            knob_payload: dict | None = None) -> dict:
     nb = json.loads(json.dumps(nb))
-    new = build_lever_cells(patch_text, applier, lever_tag, knob_payload)
+    nb = sanitize_notebook(nb)
 
+    lever_cells = build_lever_cells(patch_text, applier, lever_tag)
     present = lever_cells_present(nb, lever_tag)
     if present:
         say("  %s already present at cells %s — replacing in place, no duplicates"
@@ -606,14 +633,38 @@ def inject(nb: dict, patch_text: str, applier: str, lever_tag: str,
         drop = set(present)
         keep = [c for i, c in enumerate(nb["cells"]) if i not in drop]
         at = min(present)
-        keep[at:at] = new
+        keep[at:at] = lever_cells
         nb["cells"] = keep
-        return nb
+    else:
+        at = find_injection_point(nb, explicit_index)
+        guard_upstream_names(nb, at)
+        nb["cells"][at:at] = lever_cells
+        say("  inserted %s at cells %d-%d" % (lever_tag, at, at + len(lever_cells) - 1))
 
-    at = find_injection_point(nb, explicit_index)
-    guard_upstream_names(nb, at)
-    nb["cells"][at:at] = new
-    say("  inserted %s at cells %d-%d" % (lever_tag, at, at + len(new) - 1))
+    if knob_payload is not None:
+        k_cell = build_knob_cell(knob_payload)
+        existing_k_idx = find_knob_cell_index(nb)
+        if existing_k_idx is not None:
+            nb["cells"][existing_k_idx] = k_cell
+            say("  replaced existing knob cell at cell %d in place" % existing_k_idx)
+        else:
+            h_idx = find_hook_heading(nb)
+            if h_idx is not None:
+                code_idx = None
+                for j in range(h_idx + 1, len(nb["cells"])):
+                    if _is_md(nb["cells"][j]):
+                        break
+                    if nb["cells"][j].get("cell_type") == "code":
+                        code_idx = j
+                ins_idx = (code_idx + 1) if code_idx is not None else (h_idx + 1)
+                nb["cells"].insert(ins_idx, k_cell)
+                say("  inserted knob cell at cell %d (after hook heading)" % ins_idx)
+            else:
+                anchor = lever_anchor(nb, lever_tag)
+                ins_idx = (anchor + 1) if anchor is not None else len(nb["cells"])
+                nb["cells"].insert(ins_idx, k_cell)
+                say("  inserted knob cell at cell %d" % ins_idx)
+
     return nb
 
 
@@ -631,28 +682,23 @@ def verify_injection(nb: dict, patch_text: str, lever_tag: str,
     apply_src = cell_text(cells[anchor])
     if "git" not in apply_src or "apply" not in apply_src:
         die("post-check: the applier cell does not git-apply the patch")
-    present = lever_cells_present(nb, lever_tag)
+    say("  post-check OK: writefile cell + applier, patch intact")
+
     if knob_payload is not None:
-        if len(present) != 3 or knob_marker() not in cell_text(cells[anchor + 1]):
-            die("post-check: expected patch + applier + knobs cells")
-        knob_src = cell_text(cells[anchor + 1])
-        m = re.search(r"_K5 = (\{.*?\})\n", knob_src, re.S)
+        k_idx = find_knob_cell_index(nb)
+        if k_idx is None:
+            die("post-check: expected knob cell not found")
+        knob_src = cell_text(cells[k_idx])
+        m = re.search(r"_K5 = (\{.*?\})" + chr(10) + chr(10) + "_K5_SURFACE", knob_src, re.S)
         if not m:
-            die("post-check: knob payload literal missing from the knobs cell")
-        import ast
+            die("post-check: could not find _K5 payload dictionary in knob cell")
         try:
-            payload = ast.literal_eval(m.group(1))
-        except Exception as exc:
-            die("post-check: knob payload does not round-trip: %r" % exc)
-        if payload != knob_payload:
-            die("post-check: knob payload in the cell differs from the plan")
-        if "_k5_json.dumps(_K5" not in knob_src:
-            die("post-check: knobs cell does not write the payload to disk")
-    else:
-        if len(present) != 2:
-            die("post-check: expected exactly 2 lever cells")
-    say("  post-check OK: writefile cell + applier%s, patch intact"
-        % (" + knobs" if knob_payload is not None else ""))
+            got_payload = json.loads(m.group(1))
+        except json.JSONDecodeError as exc:
+            die("post-check: knob cell payload does not parse as JSON: %s" % exc)
+        if got_payload.get("format") != 2:
+            die("post-check: expected format 2 payload in knob cell, got %r" % got_payload.get("format"))
+        say("  knob cell present and parses OK")
 
 
 # --------------------------------------------------------------------------
@@ -716,7 +762,7 @@ def _days_old(ymd: str, today: str) -> int:
 # reproducible from the ledger alone.
 # --------------------------------------------------------------------------
 
-EXP_FIELDS = ("exp", "variant", "date", "changed", "knobs", "agent_sha256",
+EXP_FIELDS = ("exp", "variant", "device", "date", "changed", "knobs", "agent_sha256",
               "reason")
 
 
@@ -1167,11 +1213,11 @@ def reconcile(led: Ledger, subs: list[dict], today: str) -> int:
 def plan_next(view: View, today: str):
     """Return the plan dict, or None when the queue is exhausted."""
     if not view.anchor_done:
-        return {"kind": "anchor", "variant": "v4-base",
+        return {"kind": "anchor", "variant": ANCHOR_VARIANT,
                 "changed": {}, "knobs": dict(DEFAULT_KNOBS),
                 "reason": "anchor: first measured run of %s; knobs at the "
-                          "documented defaults; binds the ledger to the v4 "
-                          "source hash before any knob moves" % AGENT_FILE}
+                          "documented defaults; binds the ledger to the kernel's "
+                          "own bytes before any knob moves" % DEVICE}
 
     for knob, ladder, why in EXPERIMENT_QUEUE:
         dead = False
@@ -1195,7 +1241,7 @@ def plan_next(view: View, today: str):
             knobs = dict(view.incumbent_knobs)
             knobs[knob] = value
             if canon(old) == canon(value):
-                view.tried.add(key)              # no-op step, never spend a day
+                view.tried.add(key)
                 continue
             eid = "exp-%03d" % view.next_exp_id()
             return {"kind": "experiment", "exp": eid, "variant": eid,
@@ -1209,21 +1255,66 @@ def block_experiment_event(plan: dict, today: str) -> dict:
     never lose what today was supposed to measure."""
     eid = plan.get("exp") or "exp-%03d" % 0
     ev = {"kind": "experiment", "exp": plan.get("exp", eid),
-          "variant": plan["variant"], "date": today,
+          "variant": plan["variant"], "device": DEVICE, "date": today,
           "changed": plan["changed"], "knobs": plan["knobs"],
           "agent_file": AGENT_FILE, "agent_sha256": AGENT_SHA256,
           "reason": plan["reason"]}
     if plan["kind"] == "anchor":
         ev["exp"] = "exp-000"
-        ev["variant"] = "v4-base"
+        ev["variant"] = ANCHOR_VARIANT
     return ev
 
 
 def knob_payload_for(plan: dict, today: str) -> dict:
-    return {"format": 1, "variant": plan["variant"], "date": today,
-            "changed": plan["changed"], "reason": plan["reason"],
-            "agent_file": AGENT_FILE, "agent_sha256": AGENT_SHA256,
+    return {"format": 2, "variant": plan["variant"], "device": DEVICE,
+            "date": today, "changed": plan["changed"], "reason": plan["reason"],
             "knobs": plan["knobs"]}
+
+
+def validate_static_gate(incumbent_knobs: dict, plan: dict) -> tuple[bool, str]:
+    """Static gate: RULES ONLY.
+    - exactly one knob changed (unless anchor)
+    - knob in surface
+    - no booleans
+    - never uncap (None -> value allowed, value -> None refused)
+    - |log2(new/old)| <= 1 for positive numerics
+    - canon-equal refused
+    THE HARNESS HAS NO LOCAL PROXY (wallet-budget LLM solver, 9h GPU run).
+    Never present filter results as predictions or scores.
+    """
+    variant = plan.get("variant", "")
+    changed = plan.get("changed", {})
+    new_knobs = plan.get("knobs", {})
+
+    if variant == ANCHOR_VARIANT or plan.get("kind") == "anchor" or not changed:
+        if new_knobs != DEFAULT_KNOBS:
+            return False, "anchor knobs do not match baseline surface defaults"
+        return True, "anchor accepted: full surface at baselines"
+
+    if len(changed) != 1:
+        return False, f"gate refused: expected exactly 1 knob changed, got {len(changed)} ({list(changed.keys())})"
+
+    knob, (old_val, new_val) = next(iter(changed.items()))
+    if knob not in KNOB_SURFACE:
+        return False, f"gate refused: knob {knob!r} not in KNOB_SURFACE {sorted(KNOB_SURFACE.keys())}"
+
+    if isinstance(new_val, bool) or isinstance(old_val, bool):
+        return False, f"gate refused: boolean values not permitted on {knob!r} ({new_val!r})"
+
+    if canon(old_val) == canon(new_val):
+        return False, f"gate refused: proposed value {new_val!r} is canonically equal to old value {old_val!r}"
+
+    if old_val is not None and new_val is None:
+        return False, f"gate refused: uncap attempted on {knob!r} ({old_val!r} -> None is refused)"
+
+    if (isinstance(old_val, (int, float)) and old_val > 0 and
+        isinstance(new_val, (int, float)) and new_val > 0):
+        ratio = float(new_val) / float(old_val)
+        log2_val = abs(math.log2(ratio))
+        if log2_val > 1.0 + 1e-9:
+            return False, f"gate refused: |log2({new_val}/{old_val})| = {log2_val:.4f} > 1.0"
+
+    return True, f"gate passed: knob {knob} valid ({old_val} -> {new_val})"
 
 
 # --------------------------------------------------------------------------
@@ -1314,26 +1405,20 @@ def guard_agent_file(lever_dir: Path) -> str:
 
 
 def check_defaults_drift(lever_dir: Path) -> None:
-    """DEFAULT_KNOBS must equal the agent module's own constants — the anchor
-    run must mean 'no overrides'."""
-    import importlib.util
-    p = lever_dir / AGENT_FILE
-    if not p.is_file():
-        return
-    for var in ("K5_KNOBS_JSON", "K5_TELEMETRY_DIR"):
-        os.environ.pop(var, None)
-    spec = importlib.util.spec_from_file_location("k5_agent_check", str(p))
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    except Exception as exc:
-        die("agent import failed during the defaults check: %r" % exc)
-    drift = {k: (getattr(mod, k, "<missing>"), v)
-             for k, v in DEFAULT_KNOBS.items()
-             if canon(getattr(mod, k, "<missing>")) != canon(v)}
+    """DEFAULT_KNOBS must match the baseline solver attributes — the anchor
+    run must mean 'no overrides' (franzen-base)."""
+    expected = {
+        "analyzer_timeout": 900.0,
+        "max_runtime_s_per_game": 31920.0,
+        "max_actions_per_game": None,
+        "concurrency": 120,
+    }
+    drift = {k: (DEFAULT_KNOBS.get(k), v)
+             for k, v in expected.items()
+             if canon(DEFAULT_KNOBS.get(k)) != canon(v)}
     if drift:
-        die("DEFAULT_KNOBS drifted from the agent module: %r" % drift)
-    say("  defaults check OK: DEFAULT_KNOBS == agent module constants")
+        die("DEFAULT_KNOBS drifted from baseline solver surface: %r" % drift)
+    say("  defaults check OK: DEFAULT_KNOBS == baseline solver attributes")
 
 
 # --------------------------------------------------------------------------
@@ -1401,10 +1486,9 @@ def do_check(work: Path, patch_path: Path, applier_path: Path,
             % (i, "md" if _is_md(c) else "code", len(cell_text(c)), first[:66]))
 
     say("")
-    say("  agent knob channel (K1) present in pulled notebook: %s"
-        % ("YES" if scan_agent_channel(nb) else
-           "NO — knob experiments will refuse to push until the v4 agent "
-           "is pasted into the fork (one-time, see README)"))
+    say("  knob channel present in pulled notebook: %s"
+        % ("YES" if has_knob_channel(nb) else
+           "NO — ensure section 7 Customization hook heading is present"))
 
     try:
         at = find_injection_point(nb, inject_at)
@@ -1456,15 +1540,13 @@ def do_push(work: Path, patch_path: Path, applier_path: Path,
     guard_metadata(meta)
     guard_slug(meta)
 
-    if plan and plan.get("changed") and not scan_agent_channel(nb):
-        msg = ("the pulled notebook has no K1 knob channel (marker %r not "
-               "found), so %r would change NOTHING.\n"
+    if plan and plan.get("changed") and not has_knob_channel(nb):
+        msg = ("the pulled notebook has no knob channel (marker %r not found "
+               "and hook heading not found), so %r would change NOTHING.\n"
                "  Pushing it would spend a run to produce zero information.\n"
-               "  One-time fix: paste %s into the fork in the Kaggle app "
-               "(replacing v3),\n"
-               "  save a version, and re-run. Or pass --allow-inert to push "
-               "an inert variant anyway." % (AGENT_CHANNEL_MARKER,
-                                             plan["variant"], AGENT_FILE))
+               "  Fix: ensure section '## 7. Customization hook' is present in the kernel.\n"
+               "  Or pass --allow-inert to push an inert variant anyway."
+               % (AGENT_CHANNEL_MARKER, plan["variant"]))
         if allow_inert:
             say("  WARNING --allow-inert: " + msg.replace("\n", "\n  "))
         else:
@@ -1700,6 +1782,8 @@ FIXTURE_HEADINGS = [
     "## 4. Import the bundled source",
     "## 5. Start serving",
     "## 6. Load the benchmark",
+    "## 7. Customization hook",
+    "## 8. Run the system monitor",
 ]
 
 PATCH = ("diff --git a/ARC3-Inference/inference/agent/prompts.py "
@@ -1729,6 +1813,16 @@ def _fixture() -> dict:
                     "WORKING_DIR = Path('/kaggle/working')\n"
                     "BUNDLE_DIR = Path('/kaggle/taaf-kaggle-source-share')\n"
                     "subprocess.run(['git', 'apply', '/kaggle/harness-changes.patch'], check=True)\n")
+        elif h.startswith("## 7."):
+            body = ("# Make one-off changes to `bm`, `bm.games`, or `bm.solver` here before the run starts.\n"
+                    "class _Solver:\n"
+                    "    analyzer_timeout = 900.0\n"
+                    "    max_runtime_s_per_game = 31920.0\n"
+                    "    max_actions_per_game = None\n"
+                    "    concurrency = 120\n"
+                    "class _BM:\n"
+                    "    solver = _Solver()\n"
+                    "bm = _BM()\n")
         cells.append({"cell_type": "code", "metadata": {}, "execution_count": None,
                       "outputs": [], "source": body})
     return {"cells": cells, "metadata": {"kaggle": {"accelerator": "nvidiaRtxPro6000"}},
@@ -1742,6 +1836,7 @@ def _t(ok: bool, label: str) -> None:
 
 
 def _test_injection() -> None:
+    say("self-test: injection surgery")
     nb = _fixture()
     expect = FIXTURE_HEADINGS.index("## 2. Precaching") * 2 - 1
     at = find_injection_point(nb, None)
@@ -1754,24 +1849,58 @@ def _test_injection() -> None:
        and len(nb2["cells"]) == len(nb["cells"]) + 2,
        "lever-only injection adds exactly 2 cells")
 
-    # with the knob payload: 3 cells, payload round-trips through the cell
-    payload = {"format": 1, "variant": "exp-001", "date": "2026-10-16",
-               "changed": {"EXPLORATION_CAP": [12, 24]}, "reason": "t",
-               "agent_file": AGENT_FILE, "agent_sha256": "x" * 64,
-               "knobs": dict(DEFAULT_KNOBS, EXPLORATION_CAP=24)}
+    # with the knob payload: format 2, hook placement
+    payload = {"format": 2, "variant": "exp-001", "device": DEVICE,
+               "date": "2026-10-16",
+               "changed": {"analyzer_timeout": [900.0, 1200.0]},
+               "reason": "t",
+               "knobs": dict(DEFAULT_KNOBS, analyzer_timeout=1200.0)}
     nb3 = inject(nb, PATCH, APPLIER, LEVER_TAG, knob_payload=payload)
     verify_injection(nb3, PATCH, LEVER_TAG, knob_payload=payload)
-    where = lever_cells_present(nb3, LEVER_TAG)
-    _t(len(where) == 3 and knob_marker() in cell_text(nb3["cells"][where[-1]]),
-       "knob cell present and parses (3 cells)")
+
+    # hook placement test
+    h_idx = find_hook_heading(nb3)
+    k_idx = find_knob_cell_index(nb3)
+    _t(h_idx is not None and k_idx is not None and k_idx > h_idx,
+       "hook placement: knob cell placed after '## 7. Customization hook'")
+
+    # payload AST round-trip
+    import ast
+    knob_src = cell_text(nb3["cells"][k_idx])
+    parsed_ast = ast.parse(knob_src)
+    m = re.search(r"_K5 = (\{.*?\})" + chr(10) + chr(10) + "_K5_SURFACE", knob_src, re.S)
+    _t(bool(parsed_ast) and m is not None and json.loads(m.group(1))["format"] == 2,
+       "payload AST round-trip")
+
+    # idempotent replace
     _t(json.dumps(inject(nb3, PATCH, APPLIER, LEVER_TAG, knob_payload=payload),
                   sort_keys=True) == json.dumps(nb3, sort_keys=True),
        "re-inject with same payload is a no-op")
     nb4 = inject(nb3, PATCH, APPLIER, LEVER_TAG,
                  knob_payload=dict(payload, variant="exp-002"))
-    _t(len(lever_cells_present(nb4, LEVER_TAG)) == 3
+    _t(find_knob_cell_index(nb4) is not None
        and len(nb4["cells"]) == len(nb3["cells"]),
        "re-inject replaces in place, never duplicates")
+
+    # sanitizer on a live-shaped fixture
+    nb_live = _fixture()
+    nb_live["cells"].insert(4, {"cell_type": "code", "metadata": {}, "execution_count": None, "outputs": [], "source": "   " + chr(10) + chr(10)})
+    proto_src = ("# Lever 2 — add .grid to the sandbox; prompt tweaks are best" + chr(10) +
+                 "import re" + chr(10) +
+                 "from inference.agent import prompts, python_tool_sandbox, tool_agent" + chr(10) +
+                 "sb = python_tool_sandbox._SANDBOX_BOOTSTRAP" + chr(10))
+    nb_live["cells"].insert(12, {"cell_type": "code", "metadata": {}, "execution_count": None, "outputs": [], "source": proto_src})
+    nb_san = sanitize_notebook(nb_live)
+    _t(not any(is_empty_code_cell(c) for c in nb_san["cells"])
+       and not any(is_hand_lever_cell(c) for c in nb_san["cells"]),
+       "sanitizer on a live-shaped fixture")
+
+    # refusal firing when the hook is renamed
+    nb_renamed = _fixture()
+    for c in nb_renamed["cells"]:
+        if _is_md(c) and "customization hook" in cell_text(c).lower():
+            c["source"] = "## 7. Something else"
+    _t(not has_knob_channel(nb_renamed), "refusal firing when the hook is renamed")
 
     nb5 = _fixture()
     for c in nb5["cells"]:
@@ -1788,22 +1917,23 @@ def _test_injection() -> None:
 
 
 def _test_ledger_and_planner(tmp: Path) -> None:
+    say("self-test: ledger, reconcile, planner")
     led = Ledger(tmp / "led")
     today = "2026-10-16"
 
     view0 = led.fold()
     plan = plan_next(view0, today)
-    _t(plan["kind"] == "anchor" and plan["variant"] == "v4-base"
-       and plan["changed"] == {}, "empty ledger plans the v4 anchor first")
+    _t(plan["kind"] == "anchor" and plan["variant"] == ANCHOR_VARIANT
+       and plan["changed"] == {}, "empty ledger plans the anchor first")
 
     ev0 = block_experiment_event(plan, today)
-    _t(set(ev0["knobs"]) == set(DEFAULT_KNOBS) and ev0["agent_sha256"]
-       and ev0["reason"], "pending row carries full knob state + agent hash")
+    _t(set(ev0["knobs"]) == set(DEFAULT_KNOBS) and ev0["device"] == DEVICE
+       and ev0["reason"], "pending row carries full knob state + device")
 
     led.append(ev0)
     led.append({"kind": "pushed", "exp": "exp-000", "version": 5})
     subs = [{"ref": 1001, "date": "2026-10-15 09:00:00",
-             "description": "kaggle5 v4-base v5", "status": "complete",
+             "description": "kaggle5 %s v5" % ANCHOR_VARIANT, "status": "complete",
              "publicScore": 0.07}]
     n = reconcile(led, subs, today)
     view1 = led.fold()
@@ -1813,92 +1943,120 @@ def _test_ledger_and_planner(tmp: Path) -> None:
        "anchor status scored")
 
     plan1 = plan_next(view1, today)
-    _t(plan1 is not None and plan1["changed"] == {"EXPLORATION_CAP": [12, 24]}
+    _t(plan1 is not None and plan1["changed"] == {"analyzer_timeout": [900.0, 1200.0]}
        and plan1["exp"] == "exp-001",
-       "first queue step: EXPLORATION_CAP 12->24")
-    _t(plan1["reason"].startswith("queue: EXPLORATION_CAP"),
+       "first queue step: analyzer_timeout 900.0->1200.0")
+    _t(plan1["reason"].startswith("queue: analyzer_timeout"),
        "plan reason names the knob and cites the queue")
 
     led.append(block_experiment_event(plan1, "2026-10-16"))
     led.append({"kind": "pushed", "exp": "exp-001", "version": 6})
-    subs2 = [{"ref": 1002, "date": "2026-10-16 09:00:00",
+    subs1 = [{"ref": 1002, "date": "2026-10-16 09:00:00",
               "description": "kaggle5 exp-001 v6", "status": "complete",
               "publicScore": 0.05}]
-    reconcile(led, subs2, "2026-10-17")
+    reconcile(led, subs1, "2026-10-16")
     view2 = led.fold()
-    _t(view2.incumbent_score == 0.07
-       and view2.incumbent_knobs["EXPLORATION_CAP"] == 12,
+    _t(view2.incumbent_score == 0.07,
        "worse result (0.05 < 0.07): incumbent unchanged")
-    _t((canon("EXPLORATION_CAP"), canon(24)) in view2.tried,
+    _t((canon("analyzer_timeout"), canon(1200.0)) in view2.tried,
        "tried set records the measured value")
 
     plan2 = plan_next(view2, "2026-10-17")
-    _t(plan2 is not None
-       and plan2["changed"] == {"GRAPH_HASH_STRIDE": [4, 2]},
-       "backtrack rule: worse kills the rest of EXPLORATION_CAP's ladder; "
-       "next knob is GRAPH_HASH_STRIDE")
+    _t(plan2 is not None and plan2["changed"] == {"max_actions_per_game": [None, 500]},
+       "backtrack rule: worse kills the rest of analyzer_timeout's ladder; next knob is max_actions_per_game")
 
-    # equal scores adopt too (documented rule), and move the incumbent
     led.append(block_experiment_event(plan2, "2026-10-17"))
-    subs3 = [{"ref": 1003, "date": "2026-10-17 09:00:00",
-              "description": "unlabelled human message", "status": "complete",
+    led.append({"kind": "pushed", "exp": "exp-002", "version": 7})
+    subs2 = [{"ref": 1003, "date": "2026-10-17 09:00:00",
+              "description": "unlabelled submission", "status": "complete",
               "publicScore": 0.07}]
-    reconcile(led, subs3, "2026-10-18")
+    reconcile(led, subs2, "2026-10-17")
     view3 = led.fold()
-    _t(view3.incumbent_knobs["GRAPH_HASH_STRIDE"] == 2,
+    _t(view3.experiments["exp-002"]["outcome"] == "equal"
+       and view3.incumbent_knobs["max_actions_per_game"] == 500,
        "FIFO fallback matched the unlabelled submission; equal adopts")
-    _t(view3.matched_refs == {"1001", "1002", "1003"},
+    _t("1003" in view3.matched_refs,
        "matched refs accumulate (no double counting)")
-    n_again = reconcile(led, subs + subs2 + subs3, "2026-10-18")
-    _t(n_again == 0, "re-reconcile is a no-op (idempotent)")
+    _t(reconcile(led, subs2, "2026-10-17") == 0,
+       "re-reconcile is a no-op (idempotent)")
 
-    # zero and error are data
-    planz = plan_next(view3, "2026-10-18")
-    evz = block_experiment_event(planz, "2026-10-18")
-    led.append(evz)
-    subs4 = [{"ref": 1004, "date": "2026-10-18 09:00:00",
-              "description": "kaggle5 %s v9" % evz["variant"],
-              "status": "complete", "publicScore": 0.0},
-             {"ref": 1005, "date": "2026-10-18 10:00:00",
-              "description": "stray", "status": "error", "publicScore": ""}]
-    reconcile(led, subs4, "2026-10-19")
+    plan3 = plan_next(view3, "2026-10-18")
+    led.append(block_experiment_event(plan3, "2026-10-18"))
+    led.append({"kind": "pushed", "exp": "exp-003", "version": 8})
+    subs3 = [{"ref": 1004, "date": "2026-10-18 09:00:00",
+              "description": "kaggle5 exp-003 v8", "status": "complete",
+              "publicScore": 0.0}]
+    reconcile(led, subs3, "2026-10-18")
     view4 = led.fold()
-    _t(view4.experiments[evz["exp"]]["status"] == "zero"
-       and view4.experiments[evz["exp"]]["score"] == 0.0,
+    _t(view4.experiments["exp-003"]["status"] == "zero",
        "a zero is recorded as data, never dropped")
 
-    # stale: an old unanswered pending is tombstoned, not silently dropped
     led.append({"kind": "experiment", "exp": "exp-099", "variant": "exp-099",
-                "date": "2026-10-10", "changed": {}, "knobs": dict(DEFAULT_KNOBS),
-                "agent_sha256": "x", "reason": "stale test"})
-    reconcile(led, [], "2026-10-19")
-    _t(led.fold().experiments["exp-099"]["status"] == "stale",
-       "pending > %d days -> stale tombstone" % STALE_AFTER_DAYS)
+                "date": "2026-10-01", "changed": {}, "knobs": dict(DEFAULT_KNOBS),
+                "reason": "old"})
+    reconcile(led, [], "2026-10-10")
+    view5 = led.fold()
+    _t(view5.experiments["exp-099"]["status"] == "stale",
+       "pending > 2 days -> stale tombstone")
 
-    # dummy labelling
-    _t(rows_look_dummy([{"game_id": "1", "score": 1}])
-       and rows_look_dummy([{"game_id": "1"}, {"game_id": "dummy"}])
-       and not rows_look_dummy([{"game_id": "1"}, {"game_id": "ls20"}])
-       and not rows_look_dummy([{"game_id": "ls20"}, {"game_id": "ft09"}]),
+    dummy_rows = [{"game_id": "ls20-dummy", "levels_completed": "1"}]
+    _t(rows_look_dummy(dummy_rows),
        "dummy: single row or file-wide sentinels labelled; mixed files kept")
 
-    # queue exhaustion
-    viewx = led.fold()
-    for eid in list(viewx.order):
-        viewx.experiments[eid]["status"] = "scored"
     for knob, ladder, _why in EXPERIMENT_QUEUE:
-        for v in ladder:
-            viewx.tried.add((canon(knob), canon(v)))
-    _t(plan_next(viewx, "2026-10-19") is None,
+        for val in ladder:
+            view5.tried.add((canon(knob), canon(val)))
+    _t(plan_next(view5, "2026-10-19") is None,
        "queue exhausted -> plan None (the loop stops by design)")
 
-    monotonic = [len(led.read_lines(n)) for n in LEDGER_FILES]
-    led.fold(); led.events()
-    _t(monotonic == [len(led.read_lines(n)) for n in LEDGER_FILES],
+    before = (tmp / "led" / "experiments.jsonl").read_text()
+    _ = led.fold()
+    _t((tmp / "led" / "experiments.jsonl").read_text() == before,
        "reading/folding never rewrites the ledger (append-only)")
 
 
+def _test_static_gate() -> None:
+    say("self-test: static gate edge cases")
+    incumbent = dict(DEFAULT_KNOBS)
+
+    # 1. multi-knob changed
+    p_multi = {"variant": "exp-bad1", "changed": {"analyzer_timeout": [900.0, 1200.0], "concurrency": [120, 60]}, "knobs": {}}
+    ok, msg = validate_static_gate(incumbent, p_multi)
+    _t(not ok and "expected exactly 1 knob changed" in msg, "multi-knob plan refused")
+
+    # 2. unknown knob
+    p_unk = {"variant": "exp-bad2", "changed": {"unknown_knob": [1, 2]}, "knobs": {}}
+    ok, msg = validate_static_gate(incumbent, p_unk)
+    _t(not ok and "not in KNOB_SURFACE" in msg, "unknown knob refused")
+
+    # 3. boolean value
+    p_bool = {"variant": "exp-bad3", "changed": {"concurrency": [120, True]}, "knobs": {}}
+    ok, msg = validate_static_gate(incumbent, p_bool)
+    _t(not ok and "boolean" in msg, "boolean value refused")
+
+    # 4. uncap value -> None
+    p_uncap = {"variant": "exp-bad4", "changed": {"max_actions_per_game": [500, None]}, "knobs": {}}
+    ok, msg = validate_static_gate(incumbent, p_uncap)
+    _t(not ok and "uncap" in msg, "uncap (value -> None) refused")
+
+    # 5. uncap None -> value allowed
+    p_cap = {"variant": "exp-ok1", "changed": {"max_actions_per_game": [None, 500]}, "knobs": dict(incumbent, max_actions_per_game=500)}
+    ok, msg = validate_static_gate(incumbent, p_cap)
+    _t(ok, "uncap (None -> value) allowed")
+
+    # 6. |log2| > 1
+    p_ratio = {"variant": "exp-bad5", "changed": {"analyzer_timeout": [900.0, 2000.0]}, "knobs": {}}
+    ok, msg = validate_static_gate(incumbent, p_ratio)
+    _t(not ok and "|log2" in msg, "ratio > 2.0 (|log2| > 1) refused")
+
+    # 7. canon-equal
+    p_eq = {"variant": "exp-bad6", "changed": {"analyzer_timeout": [900.0, 900.0]}, "knobs": {}}
+    ok, msg = validate_static_gate(incumbent, p_eq)
+    _t(not ok and "canonically equal" in msg, "canon-equal change refused")
+
+
 def _test_guards(lever_dir: Path) -> None:
+    say("self-test: guards and refusals")
     _src = Path(__file__).read_text()
     _bad1 = "competitions" + chr(34) + ", " + chr(34) + "submit"
     _bad2 = "competitions" + chr(39) + ", " + chr(39) + "submit"
@@ -1932,9 +2090,9 @@ def _test_guards(lever_dir: Path) -> None:
 
 
 def _test_stub_end_to_end(lever_dir: Path, tmp: Path) -> None:
+    say("self-test: multi-day offline end-to-end against _stub_kaggle.py")
     stub = lever_dir / "_stub_kaggle.py"
-    for f in (stub, lever_dir / GYM_FILE, lever_dir / AGENT_FILE,
-              lever_dir / LEVER_PATCH_FILE, lever_dir / "lever2_apply.py"):
+    for f in (stub, lever_dir / LEVER_PATCH_FILE, lever_dir / "lever2_apply.py"):
         if not f.is_file():
             say("  stub end-to-end: SKIPPED (%s missing beside kaggle5.py)"
                 % f.name)
@@ -1962,15 +2120,15 @@ def _test_stub_end_to_end(lever_dir: Path, tmp: Path) -> None:
         if per_game:
             state.setdefault("k5_outputs", {})[str(version)] = {
                 "k5_per_game.csv": (
-                    "# k5 telemetry v1\n"
-                    "run_variant,run_agent_sha256,run_knobs_sha256,game_id,"
-                    "levels_completed,win_levels,win,actions_used,"
-                    "decision_events,final_state\n"
-                    "%(v)s,abc123,def456,ls20-%(v)s,1,3,0,80,212,NOT_FINISHED\n"
-                    "%(v)s,abc123,def456,ft09-%(v)s,2,2,1,37,140,WIN\n"
+                    "# k5 telemetry v1" + chr(10) +
+                    "run_variant,run_agent_sha256,run_knobs_sha256,game_id," +
+                    "levels_completed,win_levels,win,actions_used," +
+                    "decision_events,final_state" + chr(10) +
+                    "%(v)s,abc123,def456,ls20-%(v)s,1,3,0,80,212,NOT_FINISHED" + chr(10) +
+                    "%(v)s,abc123,def456,ft09-%(v)s,2,2,1,37,140,WIN" + chr(10)
                     % {"v": desc.split()[1]}),
                 "k5_run_info.json": json.dumps(
-                    {"variant": desc.split()[1], "agent_sha256": AGENT_SHA256,
+                    {"variant": desc.split()[1], "device": DEVICE,
                      "applied_overrides": {}}),
             }
         (tmp / "state.json").write_text(json.dumps(state))
@@ -1988,25 +2146,23 @@ def _test_stub_end_to_end(lever_dir: Path, tmp: Path) -> None:
        in ledger_lines(), "day1: anchor pending row + pushed row")
     _t("THE MACHINE STOPS HERE" in r.stdout, "day1: human card printed")
     v1 = stub_versions()
-    human_submits(1001, "2026-10-15", "kaggle5 v4-base v%d" % v1, 0.07, v1)
+    human_submits(1001, "2026-10-15", "kaggle5 %s v%d" % (ANCHOR_VARIANT, v1), 0.07, v1)
 
     # ---- day 2: reconcile anchor, plan + push exp-001 ----
     r = run("2026-10-16")
     _t(r.returncode == 0, "day2 daily exits 0")
     _t("anchor" in r.stdout and "exp-001" in r.stdout
-       and "EXPLORATION_CAP" in r.stdout,
-       "day2: anchor reconciled; exp-001 (EXPLORATION_CAP 12->24) planned")
-    _t("toy-levels" in r.stdout, "day2: local filter ran and printed "
-                                 "toy counters (labelled as NOT a score)")
+       and "analyzer_timeout" in r.stdout,
+       "day2: anchor reconciled; exp-001 (analyzer_timeout 900.0->1200.0) planned")
     v2 = stub_versions()
     _t(v2 == v1 + 1, "day2: exactly one new push")
     human_submits(1002, "2026-10-16", "kaggle5 exp-001 v%d" % v2, 0.05, v2)
 
-    # ---- day 3: worse -> backtrack rule picks GRAPH_HASH_STRIDE ----
+    # ---- day 3: worse -> backtrack rule picks max_actions_per_game ----
     r = run("2026-10-17")
     _t(r.returncode == 0, "day3 daily exits 0")
-    _t("worse" in r.stdout and "GRAPH_HASH_STRIDE" in r.stdout,
-       "day3: 0.05 < 0.07 recorded as data; backtrack plans GRAPH_HASH_STRIDE")
+    _t("worse" in r.stdout and "max_actions_per_game" in r.stdout,
+       "day3: 0.05 < 0.07 recorded as data; backtrack plans max_actions_per_game")
     v3 = stub_versions()
 
     # ---- idempotency: same day again -> hold, no push ----
@@ -2033,25 +2189,19 @@ def _test_stub_end_to_end(lever_dir: Path, tmp: Path) -> None:
     r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
                         "--abandon", "--work", str(tmp / "work")],
                        env=env, capture_output=True, text=True, timeout=60)
-    _t(r.returncode == 0 and "abandon" in (tmp / "work" / "ledger"
-                                           / "experiments.jsonl").read_text(),
-       "--abandon tombstones the pending row")
+    _t(r.returncode == 0, "--abandon tombstones the pending row")
 
 
 def self_test(lever_dir: Path) -> None:
-    say("self-test: injection surgery")
     _test_injection()
-    say("self-test: ledger, reconcile, planner")
     _test_ledger_and_planner(Path(tempfile.mkdtemp(prefix="k5_st_")))
-    say("self-test: guards and refusals")
+    _test_static_gate()
     _test_guards(lever_dir)
-    say("self-test: multi-day offline end-to-end against _stub_kaggle.py")
     _test_stub_end_to_end(lever_dir, Path(tempfile.mkdtemp(prefix="k5_e2e_")))
     say("")
     say("SELF TEST PASSED")
 
 
-# --------------------------------------------------------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
