@@ -282,16 +282,12 @@ cells = [
        " run log; the bottom of a push log is the human card (what to tap)."),
     code("!python kaggle5.py --stage daily"),
 
-    md("## 7 — Manual ops (watching or debugging, all still submit-free)\n"),
-    code("# smoke-filter an ad-hoc idea against the five toys (a filter, not a score)\n"
-         "!python kaggle5.py --stage gym --set EXPLORATION_CAP=20"),
-    code("# push an ad-hoc experiment outside the queue (writes a pending row first)\n"
-         "# !python kaggle5.py --stage push --set GRAPH_HASH_STRIDE=2\n"
-         "\n"
-         "# tell the ledger you are NOT submitting the current pending variant\n"
-         "# !python kaggle5.py --abandon"),
-    code("# read the score table back by hand\n"
-         "!python kaggle5.py --stage score"),
+    md("## 7 — Manual ops (optional, run only by hand when needed)\n"),
+    code("# Optional manual ops — uncomment if needed:\n"
+         "# !python kaggle5.py --stage plan\n"
+         "# !python kaggle5.py --stage score\n"
+         "# !python kaggle5.py --abandon\n"
+         "pass"),
 
     md(
         "## The machine never submits — what you do instead\n"

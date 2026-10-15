@@ -337,8 +337,13 @@ def guard_metadata(meta: dict) -> None:
     say("  %-22s %r" % ("machine_shape", meta.get("machine_shape")))
 
     def missing(expected: list[str], actual: list[str]) -> list[str]:
-        have = {norm(x).lstrip("c/") for x in (actual or [])}
-        return [e for e in expected if norm(e) not in have]
+        have = [norm(x).lstrip("c/") for x in (actual or [])]
+        out = []
+        for e in expected:
+            ne = norm(e)
+            if not any(h == ne or h.startswith(ne + "/") for h in have):
+                out.append(e)
+        return out
 
     problems = []
     if m := missing(EXPECTED_COMPETITION_SOURCES, meta.get("competition_sources")):
@@ -864,17 +869,20 @@ class Ledger:
             "id": LEDGER_DATASET,
             "licenses": [{"name": "CC0-1.0"}],
         }
+        (self.dir / "dataset-metadata.json").write_text(json.dumps(meta, indent=1))
         (self.dir / "datasets-metadata.json").write_text(json.dumps(meta, indent=1))
         r = kaggle(["datasets", "version", "-p", str(self.dir),
                     "-m", note[:250], "-t", "-q"], allow_fail=True, quiet=True)
         if r.returncode == 0:
             say("  ledger sync-out: new dataset version (%s)" % note)
             return
-        r = kaggle(["datasets", "create", "-p", str(self.dir), "-q"],
+        r = kaggle(["datasets", "create", "-p", str(self.dir), "-t", "-q"],
                    allow_fail=True, quiet=True)
         if r.returncode == 0:
             say("  ledger sync-out: dataset created (%s)" % LEDGER_DATASET)
             return
+        if r.stdout and r.stdout.strip():
+            say("  ledger create note: %s" % r.stdout.strip().splitlines()[0])
         if self._github_fallback(note):
             return
         say("")
