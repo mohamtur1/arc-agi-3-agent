@@ -6,15 +6,22 @@ Drive it with:  KAGGLE_BIN="python3 /path/_stub_kaggle.py"
 Environment:
   STUB_LOG    append-only log of every invocation   (default /tmp/kaggle5_stub.log)
   STUB_STATE  json state file                       (default /tmp/kaggle5_stub_state.json)
+  STUB_DATA   dir backing the datasets endpoints    (default /tmp/kaggle5_stub_data)
+
+The test harness drives time and outcomes by editing the state file between
+runs (stub versions of "the human submitted in the app" and "the rerun
+produced telemetry"): keys "subs" and "k5_outputs".
 """
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 LOG = Path(os.environ.get("STUB_LOG", "/tmp/kaggle5_stub.log"))
 STATE = Path(os.environ.get("STUB_STATE", "/tmp/kaggle5_stub_state.json"))
+DATA = Path(os.environ.get("STUB_DATA", "/tmp/kaggle5_stub_data"))
 
 NB_HEADINGS = [
     "# About this notebook",
@@ -57,7 +64,8 @@ def rec(*a):
 def state():
     if STATE.exists():
         return json.loads(STATE.read_text())
-    return {"version": 4, "status": "complete", "subs": [], "pushed": None}
+    return {"version": 4, "status": "complete", "subs": [], "pushed": None,
+            "k5_outputs": {}, "submission_limits": True}
 
 
 def save(d):
@@ -75,6 +83,11 @@ def notebook():
                     "WORKING_DIR = Path('/kaggle/working')\n"
                     "BUNDLE_DIR = Path('/kaggle/taaf-kaggle-source-share')\n"
                     "subprocess.run(['git', 'apply', '/kaggle/harness-changes.patch'], check=True)\n")
+        elif h.startswith("## 4."):
+            # stands in for the bundled v4 agent: carries the K1 marker so the
+            # driver's knob-channel scan sees what a v4-bearing fork shows.
+            body = ("# the bundled agent reads overrides from K5_KNOBS_JSON (K1)\n"
+                    "print('import bundled source')\n")
         else:
             body = "print(%r)\n" % h
         cells.append({"cell_type": "code", "metadata": {}, "execution_count": None,
@@ -100,10 +113,15 @@ def main():
     if args[:2] == ["kernels", "push"]:
         p = Path(args[args.index("-p") + 1])
         nb = json.loads((p / META["code_file"]).read_text())
+        texts = []
+        for c in nb["cells"]:
+            s = c.get("source", "")
+            texts.append(s if isinstance(s, str) else "".join(s))
         s = state()
         s["version"] += 1
         s["status"] = "running"
         s["pushed"] = {"cells": len(nb["cells"]),
+                       "has_knob_payload": any("_K5 = {" in t for t in texts),
                        "sources": json.loads((p / "kernel-metadata.json").read_text())}
         save(s)
         print("Kernel version %d successfully pushed.  Please check progress at https://www.kaggle.com/code/x"
@@ -131,7 +149,25 @@ def main():
                            "creationDate": "2026-10-12T09:00:00Z"}]))
         return 0
 
+    if args[:2] == ["kernels", "output"]:
+        spec = args[2]
+        p = Path(args[args.index("-p") + 1]) if "-p" in args else Path(".")
+        p.mkdir(parents=True, exist_ok=True)
+        s = state()
+        parts = spec.split("/")
+        v = parts[2] if len(parts) == 3 else None
+        files = (s.get("k5_outputs") or {}).get(str(v or ""))
+        if not files:
+            print("No output files found for %s" % spec, file=sys.stderr)
+            return 1
+        for name, content in files.items():
+            (p / name).write_text(content)
+        print("Downloaded %d file(s) to %s" % (len(files), p))
+        return 0
+
     if args[:2] == ["competitions", "submit"]:
+        # still modelled so the never-submit test can prove the driver
+        # never calls it: every invocation is logged above.
         s = state()
         v = args[args.index("-v") + 1]
         s["subs"].insert(0, {
@@ -151,6 +187,42 @@ def main():
 
     if args[:2] == ["competitions", "submissions"]:
         print(json.dumps(state()["subs"]))
+        return 0
+
+    if args[:2] == ["competitions", "submission-limits"]:
+        if not state().get("submission_limits", True):
+            print("404 - not available for this competition", file=sys.stderr)
+            return 1
+        print(json.dumps({"maxDailySubmissions": 1,
+                          "submissionsUsedToday": len(state()["subs"]),
+                          "note": "stub-shaped payload; the driver prints it "
+                                  "verbatim and never parses it"}))
+        return 0
+
+    if args[:2] == ["datasets", "download"]:
+        # -d owner/name ... -p dir --unzip
+        store = DATA / "kaggle5-ledger"
+        p = Path(args[args.index("-p") + 1]) if "-p" in args else Path(".")
+        if not store.is_dir():
+            print("404 - dataset not found", file=sys.stderr)
+            return 1
+        p.mkdir(parents=True, exist_ok=True)
+        for f in store.iterdir():
+            if f.is_file():
+                shutil.copy2(f, p / f.name)
+        print("Downloaded dataset to %s" % p)
+        return 0
+
+    if args[:2] in (["datasets", "create"], ["datasets", "version"]):
+        p = Path(args[args.index("-p") + 1])
+        store = DATA / "kaggle5-ledger"
+        store.mkdir(parents=True, exist_ok=True)
+        for f in p.iterdir():
+            if f.is_file():
+                shutil.copy2(f, store / f.name)
+        sub = args[1]
+        print("Your private Dataset is being created"
+              if sub == "create" else "Dataset version is being created.")
         return 0
 
     print("stub: unhandled args %s" % args, file=sys.stderr)
