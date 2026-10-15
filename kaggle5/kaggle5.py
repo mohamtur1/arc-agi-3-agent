@@ -1719,24 +1719,38 @@ def do_daily(work: Path, patch_path: Path, applier_path: Path,
         st = kernel_status()
         ver = pend.get("version")
         has_sub = kernel_has_submission_file(ver)
-        if st in ("error", "failed") or (st == "complete" and not has_sub):
+        say("  pushed kernel status: %r (version %s), has submission file: %s"
+            % (st, ver, has_sub))
+        if st in ("running", "queued"):
             say("")
-            reason = ("status %s" % st) if st in ("error", "failed") else "completed without %s" % SUBMISSION_FILE
-            say("  pushed kernel version v%s failed on Kaggle (%s) — cannot be submitted." % (ver, reason))
+            say("--- pending row %s (%s) is still running on GPU (status %r) ---"
+                % (pend["exp"], pend["variant"], st))
+            say("  pushed as version v%s on %s; hold until it finishes."
+                % (ver, pend.get("date")))
+            say("  The driver pushes nothing today, on purpose.")
+            led.sync_out("daily %s: holding on %s (running)" % (today, pend["exp"]))
+            return
+        elif not has_sub:
+            say("")
+            say("  pushed kernel version v%s completed without producing %s (status %r)."
+                % (ver, SUBMISSION_FILE, st))
             say("  auto-abandoning %s to unblock re-planning." % pend["exp"])
             led.append({"kind": "abandon", "exp": pend["exp"],
-                        "reason": "kernel run failed on Kaggle (%s)" % reason})
+                        "reason": "kernel run completed without %s (status %s)"
+                                  % (SUBMISSION_FILE, st)})
             led.sync_out("abandon %s (kernel failed)" % pend["exp"])
             view = led.fold()
         else:
             say("")
-            say("--- pending row %s (%s) is unanswered ---" % (pend["exp"], pend["variant"]))
-            say("  pushed as version v%s on %s; no completed submission matched it yet."
-                % (pend.get("version"), pend.get("date")))
+            say("--- pending row %s (%s) is ready for manual submission ---"
+                % (pend["exp"], pend["variant"]))
+            say("  pushed as version v%s on %s; finished with %s."
+                % (ver, pend.get("date"), SUBMISSION_FILE))
             say("  Either the human has not submitted (your move — see the card in")
             say("  that day's run log) or scoring is still in flight. The driver")
             say("  pushes nothing today, on purpose.")
-            led.sync_out("daily %s: holding on %s" % (today, pend["exp"]))
+            led.sync_out("daily %s: holding on %s (awaiting human submit)"
+                         % (today, pend["exp"]))
             return
 
     # ---- 3) plan ----
