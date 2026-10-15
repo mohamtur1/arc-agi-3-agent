@@ -1,28 +1,47 @@
 #!/usr/bin/env python3
-"""Build 4CBOn2_Kaggle5.ipynb from kaggle5.py + lever2-grid.patch + lever2_apply.py.
+"""Build 4CBOn2_Kaggle5.ipynb from its sources. Never hand-edit the notebook.
 
-Never hand-edit the notebook. Edit the sources, re-run this. It self-tests the
-driver first and refuses to build if that fails.
+Sources
+  kaggle5.py                 the driver (embedded + fetched at run time)
+  lever2-grid.patch          the lever (fixed artifact; never retyped)
+  lever2_apply.py            the applier cell
+  k5_gym.py                 the local filter gym
+  program_synthesis_agent_v4.py  the agent, mirrored from 4CBOn2/Kaggle at
+                             build time and PINNED by the sha256 inside
+                             kaggle5.py. If the upstream file drifts this
+                             build fails loudly instead of embedding stale
+                             bytes. Override the mirror path with
+                             K5_AGENT_SRC=/local/file when offline.
+
+Preflight runs kaggle5.py --self-test (the whole offline loop) and refuses
+to build on failure, then verifies every embedded source is byte-identical
+to its file, and fails loudly on any mismatch.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import pathlib
+import re
 import subprocess
 import sys
+import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 OUT = HERE / "4CBOn2_Kaggle5.ipynb"
 
-# Where the driver fetches its own sources at run time.
+# Where the notebook fetches its sources at run time (repo = source of truth).
 REPO = "mohamtur1/arc-agi-3-agent"
 BRANCH = "main"
 REL = "kaggle5"
+AGENT_REPO = "mohamtur1/4CBOn2"
+AGENT_REL = "Kaggle"
 
 
 def code(src: str) -> dict:
-    return {"cell_type": "code", "metadata": {"trusted": True}, "execution_count": None,
-            "outputs": [], "source": src}
+    return {"cell_type": "code", "metadata": {"trusted": True},
+            "execution_count": None, "outputs": [], "source": src}
 
 
 def md(src: str) -> dict:
@@ -32,22 +51,25 @@ def md(src: str) -> dict:
 Q3 = "'" * 3   # built, never written literally: this file's text is not embedded
 
 
-Q3 = "'" * 3   # built, never written literally
-
-
 def embed(name: str, body: str) -> dict:
-    """A cell that writes `body` to disk only if the fetch above did not."""
+    """A cell that writes `body` to disk only if the fetch above did not.
+    Always prints which side won and the sha256 of the file in play."""
     if Q3 in body:
         raise SystemExit(name + " contains a triple quote; cannot embed")
     tmpl = (
-        "import pathlib\n"
+        "import hashlib, pathlib\n"
         "D = pathlib.Path('/kaggle/working/kaggle5'); D.mkdir(parents=True, exist_ok=True)\n"
         "t = D / {name!r}\n"
+        "EMBEDDED = r" + Q3 + "\n{body}" + Q3 + ".lstrip('\\n')\n"
         "if not t.is_file() or t.stat().st_size < 100:\n"
-        "    t.write_text(r" + Q3 + "\n{body}" + Q3 + ".lstrip('\\n'))\n"
-        "    print('embedded fallback ->', t.name, t.stat().st_size, 'bytes')\n"
+        "    t.write_text(EMBEDDED)\n"
+        "    print('EMBEDDED FALLBACK used ->', t.name, t.stat().st_size, 'bytes')\n"
         "else:\n"
-        "    print('using fetched', t.name, t.stat().st_size, 'bytes')\n"
+        "    cur = t.read_text()\n"
+        "    print('using fetched', t.name, t.stat().st_size, 'bytes',\n"
+        "          '(identical to embedded)' if cur == EMBEDDED else\n"
+        "          '(DIFFERS from embedded: the repo fetch is the source of truth)')\n"
+        "print('  sha256', hashlib.sha256(t.read_bytes()).hexdigest()[:16], t.name)\n"
     )
     src = tmpl.format(name=name, body=body)
     return {"cell_type": "code",
@@ -55,160 +77,273 @@ def embed(name: str, body: str) -> dict:
             "execution_count": None, "outputs": [], "source": src}
 
 
+# --------------------------------------------------------------------------
+# gather sources
+# --------------------------------------------------------------------------
+
 driver = (HERE / "kaggle5.py").read_text()
 patch = (HERE / "lever2-grid.patch").read_text()
 applier = (HERE / "lever2_apply.py").read_text()
+gym = (HERE / "k5_gym.py").read_text()
+
+# lever2-grid.patch is a FIXED artifact (byte-identical to
+# 4CBOn2/Kaggle/franzen-grid-interface.patch). It is never retyped,
+# reformatted or rewrapped, so its digest is pinned here and the build
+# fails loudly on any drift — including a one-byte accident.
+PATCH_SHA256 = "143ae716d99374cccbe6f25b607c3f6bf6e2eb9fa50299b9a05ff5e3cfd09b69"
+if hashlib.sha256(patch.encode()).hexdigest() != PATCH_SHA256:
+    raise SystemExit(
+        "LEVER PATCH DRIFT — refusing to build. lever2-grid.patch is a fixed\n"
+        "  artifact. Expected sha256 %s, got %s.\n"
+        "  Re-extract it from source (4CBOn2/Kaggle/franzen-grid-interface.patch)\n"
+        "  and re-verify the hash; never hand-edit it."
+        % (PATCH_SHA256, hashlib.sha256(patch.encode()).hexdigest()))
+print("lever patch pin OK: sha256 %s…" % PATCH_SHA256[:16])
+
+agent_name = re.search(r'AGENT_FILE = "([^"]+)"', driver).group(1)
+agent_pin = re.search(r'AGENT_SHA256 = "([0-9a-f]{64})"', driver).group(1)
+agent_url = ("https://raw.githubusercontent.com/%s/%s/%s/%s"
+             % (AGENT_REPO, BRANCH, AGENT_REL, agent_name))
+
+mirror = HERE / agent_name
+local_override = os.environ.get("K5_AGENT_SRC", "").strip()
+if local_override:
+    agent_bytes = pathlib.Path(local_override).read_bytes()
+    mirror.write_bytes(agent_bytes)
+elif mirror.is_file():
+    agent_bytes = mirror.read_bytes()
+    fresh_url = agent_url
+    try:
+        got = urllib.request.urlopen(fresh_url, timeout=30).read()
+        agent_bytes = got          # the repo stays the source of truth
+        mirror.write_bytes(got)
+    except Exception as exc:
+        print("build: could not refresh %s (%r); building from the local mirror"
+              % (agent_url, exc))
+else:
+    agent_bytes = urllib.request.urlopen(agent_url, timeout=60).read()
+    mirror.write_bytes(agent_bytes)
+
+if hashlib.sha256(agent_bytes).hexdigest() != agent_pin:
+    raise SystemExit(
+        "AGENT PIN MISMATCH — refusing to build.\n"
+        "  %s sha256 %s\n  != pin  %s (AGENT_SHA256 in kaggle5.py)\n"
+        "  This is the anti-silent-drift guard doing its job. If the agent "
+        "changed\n  on purpose, re-pin kaggle5.py first, then rebuild."
+        % (agent_name, hashlib.sha256(agent_bytes).hexdigest(), agent_pin))
+agent = agent_bytes.decode()
+print("agent mirror OK: %s sha256 %s… (matches the driver pin)"
+      % (agent_name, agent_pin[:16]))
 
 r = subprocess.run([sys.executable, str(HERE / "kaggle5.py"), "--self-test"],
                    capture_output=True, text=True)
 if r.returncode != 0:
-    raise SystemExit("kaggle5.py --self-test FAILED, not building:\n" + r.stdout + r.stderr)
+    raise SystemExit("kaggle5.py --self-test FAILED, not building:\n"
+                     + r.stdout + r.stderr)
 print("preflight: kaggle5.py --self-test passed")
+
+fetch_list = [f for f in ("kaggle5.py", "lever2-grid.patch", "lever2_apply.py",
+                          "k5_gym.py")]
+
+# --------------------------------------------------------------------------
+# cells
+# --------------------------------------------------------------------------
 
 cells = [
     md(
-        "# 4CBOn2 — Kaggle5\n"
+        "# 4CBOn2 — Kaggle5: the between-game learning loop\n"
         "\n"
-        "Injects the lever-2 patch into the ARC-AGI-3 notebook, pushes it, submits it, "
-        "reads the score. Can run **once a day on a schedule**.\n"
+        "This notebook is the daily driver. On a schedule it: pulls the ledger,"
+        " reads yesterday's score back (per-game rows when available), picks the"
+        " next one-knob experiment from the fixed queue, smoke-filters it on five"
+        " toy games, writes the pending row, pushes the GPU kernel **and stops**\n"
         "\n"
-        "## Two ways to use it\n"
+        "**The machine never submits.** Every submission is finalized by a human"
+        " in the Kaggle app — the run prints exactly which variant was prepared,"
+        " which knob changed, and which three taps spend the daily slot.\n"
         "\n"
-        "**Automatic.** Cell 5 is the whole loop in one cell. Set this notebook to run "
-        "daily and it works out by itself whether today needs a push, a submit, a score "
-        "read, or nothing at all. It is idempotent: run it twice in a day and the second "
-        "run does nothing.\n"
+        "## Honest expectations\n"
         "\n"
-        "**Manual.** Cells 6-10 are the same steps one at a time, for when you want to "
-        "watch it.\n"
+        "This system measures; it does not compound. A fixed queue of knob"
+        " experiments is expected to find small deltas — and some negative ones,"
+        " which are still data. The durable product is one trustworthy"
+        " measurement per day and an append-only ledger that explains every"
+        " decision. The toy-gym numbers shown during a run are a smoke filter,"
+        " never a leaderboard prediction.\n"
         "\n"
         "## Settings for this notebook\n"
         "\n"
-        "- **Accelerator: none.** This notebook only makes API calls. It must be CPU, "
-        "because Kaggle will only schedule CPU notebooks.\n"
-        "- **Internet: ON.** It needs to reach the Kaggle API and GitHub.\n"
-        "- The notebook it *pushes* keeps GPU + internet off. Those come from the pulled "
-        "metadata and are verified before every push.\n"
+        "- **Accelerator: none.** CPU-only, because Kaggle only schedules CPU notebooks.\n"
+        "- **Internet: ON.** It needs the Kaggle API and GitHub.\n"
+        "- The kernel it *pushes* keeps GPU + internet OFF, verified before every push.\n"
         "\n"
         "## What it will and will not spend\n"
         "\n"
         "| action | cost |\n"
         "|---|---|\n"
-        "| `check` | free |\n"
+        "| `check` / `plan` / `score` | free |\n"
         "| `push` | one GPU run of the target kernel, up to 9 h |\n"
-        "| `submit` | **one daily submission slot** |\n"
-        "| `score` | free |\n"
+        "| submit | **one daily slot — spent only by the human, in the app** |\n"
         "\n"
-        "It refuses to push if any of the 5 inputs is missing, if internet is on, or if "
-        "the injection post-check fails. It refuses to submit unless the run is complete. "
-        "And it only ever submits the **newest** finished version — never an older one."
+        "It refuses to push when any of the 5 inputs is missing, when internet is"
+        " on, when the agent pin mismatches, when a knob experiment would be inert"
+        " (no K1 channel in the fork), or when the injection post-check fails."
     ),
 
-    md("## 1 — Install the Kaggle CLI\n\n"
-       "The driver avoids main-only flags, so the plain PyPI wheel works. "
-       "Needs internet on."),
-    code("!pip install -q --upgrade kaggle 2>&1 | tail -2\n!kaggle --version"),
+    md("## 1 — The Kaggle CLI\n\n"
+       "Install it only if the image lacks it; the driver probes every flag it"
+       " relies on against the CLI actually present, each run (>= 2.2,< 3: flags"
+       " verified live on 2.2.4)."),
+    code("import shutil, subprocess, sys\n"
+         "if not shutil.which('kaggle'):\n"
+         "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',\n"
+         "                    'kaggle>=2.2,<3'], check=True)\n"
+         "print(subprocess.run(['kaggle', '--version'], capture_output=True,\n"
+         "                     text=True).stdout.strip())"),
 
-    md("## 2 — Get the driver and the lever\n\n"
-       "Pulls from the repo so the repo stays the source of truth. Edit `lever2-grid.patch` "
-       "in git and the next run picks it up with no re-pasting."),
+    md("## 2 — Get the driver, the lever, the gym and the agent\n\n"
+       "The GitHub repo stays the source of truth; anything fetched is hashed and"
+       " printed. Files that fail to fetch fall back to the embedded byte-verified"
+       " copies in section 2b — **loudly**."),
     code(
-        "import os, pathlib\n"
+        "import hashlib, os, pathlib\n"
         "D = pathlib.Path('/kaggle/working/kaggle5'); D.mkdir(parents=True, exist_ok=True)\n"
-        f"BASE = 'https://raw.githubusercontent.com/{REPO}/{BRANCH}/{REL}'\n"
-        "for f in ('kaggle5.py', 'lever2-grid.patch', 'lever2_apply.py'):\n"
-        "    rc = os.system(f'curl -fsSL {{BASE}}/{{f}} -o {{D}}/{{f}}')\n"
-        "    print(f, 'fetched' if rc == 0 else 'FETCH FAILED -> embedded fallback will be used')\n"
+        "BASE_K5 = 'https://raw.githubusercontent.com/%s/%s/%s'\n"
+        "BASE_4CB = 'https://raw.githubusercontent.com/%s/%s/%s'\n"
+        "FAILED = []\n"
+        "for url, name in [(f'{BASE_K5}/{f}', f) for f in %r] + [(f'{BASE_4CB}/%s', %r)]:\n"
+        "    rc = os.system(f'curl -fsSL {url} -o {D}/{name}')\n"
+        "    if rc == 0:\n"
+        "        data = (D / name).read_bytes()\n"
+        "        print('fetched  %%-32s %%7d bytes  sha256 %%s'\n"
+        "              %% (name, len(data), hashlib.sha256(data).hexdigest()[:16]))\n"
+        "    else:\n"
+        "        FAILED.append(name)\n"
+        "        print('FETCH FAILED (rc=%%d) %%s -> embedded fallback will be used' %% (rc, name))\n"
+        "print()\n"
+        "if FAILED:\n"
+        "    print('!' * 60)\n"
+        "    print('FETCH FAILURES:', ', '.join(FAILED))\n"
+        "    print('using the embedded byte-verified copies in the cells below')\n"
+        "    print('!' * 60)\n"
+        "else:\n"
+        "    print('all 5 files fetched from GitHub (source of truth).')\n"
         "print(sorted(p.name for p in D.iterdir()))"
+        % (REPO, BRANCH, REL, AGENT_REPO, BRANCH, AGENT_REL,
+           fetch_list, agent_name, agent_name)
     ),
 
     md("## 2b — Embedded fallbacks\n\n"
-       "Each cell writes its file only if the fetch above did not. If you have not pushed "
-       "the repo yet, these carry the whole thing."),
+       "Each cell writes its file only if the fetch above did not, then prints"
+       " the sha256 of whatever bytes are in play."),
     embed("kaggle5.py", driver),
     embed("lever2-grid.patch", patch),
     embed("lever2_apply.py", applier),
+    embed("k5_gym.py", gym),
+    embed(agent_name, agent),
 
-    md("## 3 — Auth\n\n"
-       "Inside a Kaggle notebook the SDK reads the token Kaggle injects itself, so this "
-       "usually needs nothing. If it does, the modern CLI wants `KAGGLE_API_TOKEN` — a "
-       "`KGAT_...` token from https://www.kaggle.com/settings (API -> Create New Token). "
-       "`kaggle.json` is the legacy path."),
+    md("## 3 — Auth (never aborts)\n\n"
+       "Order: `KAGGLE_API_TOKEN`, then `KAGGLE_API_V1_TOKEN` (what Kaggle"
+       " injects itself — mapped into the modern name), then token files or"
+       " `KAGGLE_USERNAME`+`KAGGLE_KEY`, then an interactive prompt **only when"
+       " a TTY exists**, and finally Kaggle's ambient notebook auth. A scheduled"
+       " (papermill) run has no stdin, so no code path here may raise."),
     code(
-        "import os, pathlib, getpass\n"
-        "have = bool(os.environ.get('KAGGLE_API_TOKEN'))\n"
-        "for p in ('~/.kaggle/access_token', '~/.kaggle/kaggle.json'):\n"
-        "    f = pathlib.Path(os.path.expanduser(p))\n"
-        "    have = have or (f.is_file() and bool(f.read_text().strip()))\n"
-        "if have:\n"
-        "    print('credentials already present — nothing to paste')\n"
-        "else:\n"
-        "    tok = getpass.getpass('Paste your KGAT_ token (blank to rely on the injected one): ').strip()\n"
+        "import os, pathlib, sys\n"
+        "def _have_file():\n"
+        "    for p in ('~/.kaggle/access_token', '~/.kaggle/access_token.txt',\n"
+        "              '~/.kaggle/kaggle.json'):\n"
+        "        f = pathlib.Path(os.path.expanduser(p))\n"
+        "        if f.is_file() and f.read_text().strip():\n"
+        "            return p\n"
+        "    return None\n"
+        "if os.environ.get('KAGGLE_API_TOKEN'):\n"
+        "    print('auth: KAGGLE_API_TOKEN is set')\n"
+        "elif os.environ.get('KAGGLE_API_V1_TOKEN'):\n"
+        "    os.environ['KAGGLE_API_TOKEN'] = os.environ['KAGGLE_API_V1_TOKEN']\n"
+        "    print('auth: mapped KAGGLE_API_V1_TOKEN (Kaggle-injected) into KAGGLE_API_TOKEN')\n"
+        "elif _have_file():\n"
+        "    print('auth: using', _have_file())\n"
+        "elif os.environ.get('KAGGLE_USERNAME') and os.environ.get('KAGGLE_KEY'):\n"
+        "    print('auth: using KAGGLE_USERNAME/KAGGLE_KEY')\n"
+        "elif sys.stdin is not None and sys.stdin.isatty():\n"
+        "    import getpass\n"
+        "    tok = getpass.getpass('Paste a KGAT_ token (blank = use ambient auth): ').strip()\n"
         "    if tok:\n"
         "        os.environ['KAGGLE_API_TOKEN'] = tok\n"
-        "    print('continuing with whatever the environment provides')"
+        "    print('continuing with whatever the environment provides')\n"
+        "else:\n"
+        "    print('auth: no token and no TTY (scheduled run) — using Kaggle '\n"
+        "          'ambient notebook auth and CONTINUING')"
     ),
 
     md("## 4 — Free dry run\n\n"
-       "Pulls the kernel, verifies all 5 inputs, prints the heading map, and shows where "
-       "the lever would land. **Pushes nothing.** Run this first, every time."),
+       "Probes the CLI, verifies the 5 inputs + agent pin + defaults, dry-runs"
+       " the lever+knob injection, scans the fork for the K1 knob channel, then"
+       " probes submission-limits (informational). **Pushes nothing.**"),
     code("%cd /kaggle/working/kaggle5\n!python kaggle5.py --stage check"),
 
-    md("## 5 — THE DAILY CELL\n\n"
-       "This is the one you schedule. It is stateless: it asks Kaggle which versions have "
-       "a `submission.parquet` and which are already in the submission list, then does the "
-       "one right thing.\n"
-       "\n"
+    md("## 5 — Read-only: what would today do?\n\n"
+       "Reconciles any new submission against the pending row and prints the"
+       " experiment table + the next plan. Pushes nothing."),
+    code("!python kaggle5.py --stage plan"),
+
+    md("## 6 — THE DAILY CELL (this is the one you schedule)\n\n"
        "| situation | what it does |\n"
        "|---|---|\n"
-       "| already submitted today | nothing, prints the score |\n"
-       "| a run is in flight | waits for it, then decides |\n"
-       "| newest version finished and unspent | submits it, reads the score |\n"
-       "| newest version already spent | pushes a new version, exits |\n"
+       "| yesterday's submission scored | reconciles, then plans from it |\n"
+       "| pending row still unanswered | prints why, pushes nothing |\n"
+       "| variant planned | toy-filter -> pending row -> push -> **stop** |\n"
+       "| filter rejects the variant | records it, pushes nothing, moves on tomorrow |\n"
+       "| queue exhausted | prints the incumbent, pushes nothing, ever |\n"
        "\n"
-       "A scheduled run does **not** block for the 9-hour run. It pushes and exits; the "
-       "next day's run finds the finished version and submits it. That costs one day of "
-       "latency on the first cycle only. Add `--wait-here` to block instead."
-    ),
+       "A scheduled run never blocks 9 h and never submits. It emails you the"
+       " run log; the bottom of a push log is the human card (what to tap)."),
     code("!python kaggle5.py --stage daily"),
 
-    md("## 6-10 — The same steps by hand\n\nFor watching it happen, or debugging one stage."),
-    code("# 6. push: inject + push a new version. Prints the version number.\n!python kaggle5.py --stage push"),
-    code("# 7. wait: poll Phase A until it finishes\n!python kaggle5.py --stage wait"),
-    code("# 8. submit: BURNS ONE DAILY SLOT. Put the version number after -v.\n!python kaggle5.py --stage submit -v 0"),
-    code("# 9. score: read it back, compare to 25.83\n!python kaggle5.py --stage score -v 0"),
-    code("# 10. all: push -> wait -> submit -> score in one go\n!python kaggle5.py --stage all"),
+    md("## 7 — Manual ops (watching or debugging, all still submit-free)\n"),
+    code("# smoke-filter an ad-hoc idea against the five toys (a filter, not a score)\n"
+         "!python kaggle5.py --stage gym --set EXPLORATION_CAP=20"),
+    code("# push an ad-hoc experiment outside the queue (writes a pending row first)\n"
+         "# !python kaggle5.py --stage push --set GRAPH_HASH_STRIDE=2\n"
+         "\n"
+         "# tell the ledger you are NOT submitting the current pending variant\n"
+         "# !python kaggle5.py --abandon"),
+    code("# read the score table back by hand\n"
+         "!python kaggle5.py --stage score"),
 
     md(
+        "## The machine never submits — what you do instead\n"
+        "\n"
+        "After a push, the run prints the card. The taps:\n"
+        "\n"
+        "1. open the fork: https://www.kaggle.com/code/mohamedmalikturay/arc-agi-3-milestone-2-solution-3e9adb\n"
+        "2. wait for the pushed version to finish, then '...' -> **Submit to"
+        " arc-prize-2026-arc-agi-3** -> pick the pushed version\n"
+        "3. paste the message the card prints (`kaggle5 <variant> v<N>`) — it is"
+        " how tomorrow's run matches the score to the experiment with certainty\n"
+        "\n"
+        "Skip a day? The driver waits ~2 days, marks the row stale, and moves on"
+        " — nothing is silently dropped. Want to skip deliberately? Run"
+        " `--abandon` from cell 7 or tell the next run to.\n"
+        "\n"
         "## Scheduling it\n"
         "\n"
-        "Kaggle can run a notebook on a schedule. Settings panel -> "
-        "\"**Schedule a notebook to run**\" -> Frequency: **Daily**.\n"
+        "Settings -> **Schedule a notebook to run** -> Daily. CPU-only notebooks"
+        " can be scheduled (this one is); runs fire roughly on the UTC date;"
+        " every run emails you its log, pass or fail; save a version first — the"
+        " schedule runs the saved notebook.\n"
         "\n"
-        "Constraints that matter here:\n"
-        "\n"
-        "- **CPU notebooks only.** This one is CPU. Do not turn on the GPU or the "
-        "schedule option disappears.\n"
-        "- Runs fire roughly on the date in **UTC**, not at an exact time. Set "
-        "`LOCAL_UTC_OFFSET_HOURS` in `kaggle5.py` if your local day differs from UTC. "
-        "Freetown is UTC+0, so 0 is correct.\n"
-        "- Save a version first. A schedule runs the saved notebook, not your unsaved edits.\n"
-        "- You get an email for every scheduled run, pass or fail.\n"
-        "\n"
-        "## Changing the lever\n"
-        "\n"
-        "Edit `kaggle5/lever2-grid.patch` in the repo and push. The next scheduled run "
-        "fetches it. Nothing here needs re-pasting.\n"
-        "\n"
-        "The applier hash-pins the files it patches, so a patch that does not match the "
-        "bundle fails loudly instead of half-applying."
+        "LOCAL_UTC_OFFSET_HOURS in kaggle5.py is 0 (Freetown is UTC+0 all year)."
     ),
 ]
 
 nb = {
     "metadata": {
-        "kernelspec": {"language": "python", "display_name": "Python 3", "name": "python3"},
-        "language_info": {"name": "python", "file_extension": ".py", "mimetype": "text/x-python"},
+        "kernelspec": {"language": "python", "display_name": "Python 3",
+                       "name": "python3"},
+        "language_info": {"name": "python", "file_extension": ".py",
+                          "mimetype": "text/x-python"},
         "kaggle": {
             "accelerator": "none",       # required for scheduling
             "isInternetEnabled": True,   # required for the API + GitHub
@@ -232,14 +367,17 @@ for c in loaded["cells"]:
     assert isinstance(c["source"], str) and c["source"]
     assert c["cell_type"] in ("code", "markdown")
 acc = loaded["metadata"]["kaggle"]
-assert acc["accelerator"] == "none" and acc["isGpuEnabled"] is False, "must be CPU to be schedulable"
+assert acc["accelerator"] == "none" and acc["isGpuEnabled"] is False, \
+    "must be CPU to be schedulable"
 assert acc["isInternetEnabled"] is True, "driver needs internet"
 print("verify: %d cells, CPU-only, internet on (schedulable)" % len(loaded["cells"]))
 
 
 def extract(name: str) -> str:
-    hits = [c for c in loaded["cells"] if c.get("metadata", {}).get("kaggle5_embed") == name]
-    assert len(hits) == 1, "expected exactly one embed cell for %r, got %d" % (name, len(hits))
+    hits = [c for c in loaded["cells"]
+            if c.get("metadata", {}).get("kaggle5_embed") == name]
+    assert len(hits) == 1, "expected exactly one embed cell for %r, got %d" \
+        % (name, len(hits))
     src = hits[0]["source"]
     return src.split("r" + Q3 + "\n", 1)[1].rsplit(Q3, 1)[0]
 
@@ -247,10 +385,28 @@ def extract(name: str) -> str:
 d = extract("kaggle5.py")
 a = extract("lever2_apply.py")
 pb = extract("lever2-grid.patch")
-compile(d, "kaggle5.py", "exec")
-compile(a, "lever2_apply.py", "exec")
+g = extract("k5_gym.py")
+ag = extract(agent_name)
+for label, text in (("kaggle5.py", d), ("lever2_apply.py", a),
+                    ("k5_gym.py", g), (agent_name, ag)):
+    compile(text, label, "exec")
 assert d.strip() == driver.strip(), "embedded driver differs from source"
 assert a.strip() == applier.strip(), "embedded applier differs from source"
 assert pb.strip() == patch.strip(), "embedded patch differs from source"
-print("verify: driver %d chars, applier %d chars, patch %d chars - all three byte-identical to source"
-      % (len(d), len(a), len(pb)))
+assert g.strip() == gym.strip(), "embedded gym differs from source"
+assert ag.strip() == agent.strip(), "embedded agent differs from mirror"
+print("verify: driver %d, applier %d, patch %d, gym %d, agent %d chars -"
+      " all five byte-identical to source" % (len(d), len(a), len(pb), len(g), len(ag)))
+
+fetch_src = next(c for c in loaded["cells"] if c["cell_type"] == "code"
+                 and "BASE_K5 =" in c["source"])["source"]
+assert "{{BASE}}" not in fetch_src and "{BASE_K5}" in fetch_src, \
+    "bug B regression: fetch cell must interpolate BASE"
+# bug A regression rule: getpass must never appear without a TTY guard,
+# in ANY cell (the fatal version called it on a papermill run with no stdin)
+for c in loaded["cells"]:
+    if c["cell_type"] == "code" and "getpass" in c["source"]:
+        assert "isatty()" in c["source"], \
+            "bug A regression: getpass without a TTY guard in a code cell"
+print("verify: bug A (auth never aborts) and bug B (BASE interpolation, loud"
+      " fallback) fixes present in the artefact")
