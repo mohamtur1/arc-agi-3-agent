@@ -240,7 +240,12 @@ def kaggle(args: list[str], capture: bool = True, timeout: int = 900,
     double, and handy for pinning a specific install.
     """
     override = os.environ.get("KAGGLE_BIN", "").strip()
-    base = override.split() if override else [shutil.which("kaggle") or "kaggle"]
+    if override:
+        base = override.split()
+    elif shutil.which("kaggle"):
+        base = [shutil.which("kaggle")]
+    else:
+        base = [sys.executable, "-m", "kaggle"]
     cmd = base + args
     say("$ " + " ".join(cmd))
     r = subprocess.run(
@@ -253,6 +258,8 @@ def kaggle(args: list[str], capture: bool = True, timeout: int = 900,
     if capture and r.stdout and not quiet:
         say(r.stdout.rstrip())
     if r.returncode != 0 and not allow_fail:
+        if quiet and r.stdout:
+            say(r.stdout.rstrip())
         die("kaggle %s exited %d" % (args[0], r.returncode))
     return r
 
@@ -713,11 +720,17 @@ def kernel_status() -> str:
 
 
 def submissions() -> list[dict]:
-    out = kaggle(["competitions", "submissions", COMPETITION, "--format", "json",
-                  "--page-size", "20"], quiet=True).stdout
-    data = _json_from(out)
+    r = kaggle(["competitions", "submissions", COMPETITION, "--format", "json",
+                "--page-size", "20"], allow_fail=True, quiet=True)
+    if r.returncode != 0:
+        say("  competitions submissions: unavailable (rc=%d) — starting with empty submissions" % r.returncode)
+        if r.stdout and r.stdout.strip():
+            say("  " + r.stdout.strip().splitlines()[0])
+        return []
+    data = _json_from(r.stdout)
     if not isinstance(data, list):
-        die("could not parse `competitions submissions` as JSON:\n" + out[:800])
+        say("  competitions submissions: response not a JSON list — treating as empty")
+        return []
     return data
 
 

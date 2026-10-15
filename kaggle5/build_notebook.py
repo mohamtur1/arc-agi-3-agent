@@ -176,10 +176,9 @@ cells = [
        "Install it only if the image lacks it; the driver probes every flag it"
        " relies on against the CLI actually present, each run (>= 2.2,< 3: flags"
        " verified live on 2.2.4)."),
-    code("import shutil, subprocess, sys\n"
-         "if not shutil.which('kaggle'):\n"
-         "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',\n"
-         "                    'kaggle>=2.2,<3'], check=True)\n"
+    code("import subprocess, sys\n"
+         "subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade',\n"
+         "                'kaggle>=2.2,<3'], check=True)\n"
          "print(subprocess.run(['kaggle', '--version'], capture_output=True,\n"
          "                     text=True).stdout.strip())"),
 
