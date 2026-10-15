@@ -45,7 +45,14 @@ def code(src: str) -> dict:
 
 
 def md(src: str) -> dict:
-    return {"cell_type": "markdown", "metadata": {}, "source": src}
+    commented = "\n".join("# " + l if l.strip() else "#" for l in src.splitlines())
+    return {
+        "cell_type": "code",
+        "metadata": {"trusted": True},
+        "execution_count": None,
+        "outputs": [],
+        "source": commented + "\npass\n"
+    }
 
 
 Q3 = "'" * 3   # built, never written literally: this file's text is not embedded
