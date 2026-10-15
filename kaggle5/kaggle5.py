@@ -752,6 +752,21 @@ def kernel_status() -> str:
     return (m.group(1) if m else out.strip()).lower()
 
 
+def kernel_has_submission_file(version: int | None = None) -> bool:
+    spec = f"{OWNER}/{KERNEL_SLUG}" + (f"/{version}" if version else "")
+    r = kaggle(["kernels", "files", spec, "--format", "json"],
+               allow_fail=True, quiet=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return False
+    try:
+        data = _json_from(r.stdout)
+        if isinstance(data, list):
+            return any(f.get("name") == SUBMISSION_FILE for f in data)
+    except Exception:
+        pass
+    return False
+
+
 def submissions() -> list[dict]:
     r = kaggle(["competitions", "submissions", COMPETITION, "--format", "json",
                 "--page-size", "20"], allow_fail=True, quiet=True)
@@ -1702,12 +1717,15 @@ def do_daily(work: Path, patch_path: Path, applier_path: Path,
     pend = view.open_pending()
     if pend is not None:
         st = kernel_status()
-        if st in ("error", "failed"):
+        ver = pend.get("version")
+        has_sub = kernel_has_submission_file(ver)
+        if st in ("error", "failed") or (st == "complete" and not has_sub):
             say("")
-            say("  pushed kernel version failed on Kaggle (status %r) — cannot be submitted." % st)
+            reason = ("status %s" % st) if st in ("error", "failed") else "completed without %s" % SUBMISSION_FILE
+            say("  pushed kernel version v%s failed on Kaggle (%s) — cannot be submitted." % (ver, reason))
             say("  auto-abandoning %s to unblock re-planning." % pend["exp"])
             led.append({"kind": "abandon", "exp": pend["exp"],
-                        "reason": "kernel run failed on Kaggle (status %s)" % st})
+                        "reason": "kernel run failed on Kaggle (%s)" % reason})
             led.sync_out("abandon %s (kernel failed)" % pend["exp"])
             view = led.fold()
         else:
