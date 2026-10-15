@@ -7,7 +7,7 @@ from pathlib import Path
 
 PATCH = Path(WORKING_DIR) / "lever2-grid.patch"
 AGENT = Path(BUNDLE_DIR) / "src/ARC3-Inference/inference/agent"
-SCOPE = "ARC3-Inference/inference/agent/*"
+README = Path(BUNDLE_DIR) / "src/ARC3-Inference/README.md"
 
 # Post-image git blob hashes, recorded in the patch's own index lines.
 POST = {
@@ -15,6 +15,13 @@ POST = {
     "python_tool_sandbox.py": "71f7172e9ee7555e44bc5e5f6743a2567b0f95b8",
     "tool_agent.py": "6b21669ee7c17ab757cea202085f65707515efd6",
 }
+
+# The patch's 4th hunk is the bundle README. Its index line is abbreviated
+# (3674ea5..9a9e10f), so the README is verified by prefix, again taken from
+# the patch's own text. No --include scope anymore: git apply accepts only
+# ONE include pattern per invocation, and the old SCOPE glob silently
+# skipped this README hunk. The patch's own paths already scope it.
+README_POST_PREFIX = "9a9e10f"
 
 
 def blob_hash(path):
@@ -26,17 +33,29 @@ def snapshot():
     return {name: blob_hash(AGENT / name) for name in POST}
 
 
+def readme_post_ok():
+    return README.is_file() and blob_hash(README).startswith(README_POST_PREFIX)
+
+
 if not AGENT.is_dir():
     raise FileNotFoundError("run the section 1 setup cell first: " + str(AGENT))
 if not PATCH.is_file():
     raise FileNotFoundError("run the 4b-1 cell first: " + str(PATCH))
 
 if snapshot() == POST:
-    print("lever 2: already applied, nothing to do")
+    if readme_post_ok():
+        print("lever 2: already applied, nothing to do (all 4 hunks verified)")
+    else:
+        raise RuntimeError(
+            "lever 2: the 3 code files are patched but ARC3-Inference/README.md "
+            "is not in the post-patch state. This bundle was patched by an "
+            "older applier that silently skipped the README hunk. Re-run the "
+            "section 1 setup cell (fresh bundle copy), then this cell."
+        )
 else:
     try:
         subprocess.run(
-            ["git", "apply", "--include=" + SCOPE, "-v", str(PATCH)],
+            ["git", "apply", "-v", str(PATCH)],
             cwd=str(Path(BUNDLE_DIR) / "src"), check=True,
             capture_output=True, text=True,
         )
@@ -50,7 +69,11 @@ else:
     if after != POST:
         bad = [n for n in POST if after[n] != POST[n]]
         raise RuntimeError("lever 2 FAILED hash check: " + ", ".join(bad))
-    print("lever 2: applied and hash-verified")
+    if not readme_post_ok():
+        raise RuntimeError(
+            "lever 2 FAILED: ARC3-Inference/README.md did not land in the "
+            "patch's post state (git blob prefix " + README_POST_PREFIX + ")")
+    print("lever 2: applied and hash-verified (3 code files + README hunk)")
 
 # The capability itself: the sandbox must expose a numeric grid property.
 boot = (AGENT / "python_tool_sandbox.py").read_text()
