@@ -625,6 +625,10 @@ def build_knob_cell(payload: dict) -> dict:
         "# per knob, and writes /kaggle/working/k5_knobs.json." + chr(10) +
         "import json as _k5_json" + chr(10) +
         "import pathlib as _k5_pathlib" + chr(10) + chr(10) +
+        "# JSON literal aliases so valid JSON is valid Python at runtime" + chr(10) +
+        "null = None" + chr(10) +
+        "false = False" + chr(10) +
+        "true = True" + chr(10) + chr(10) +
         "_K5 = " + json.dumps(payload, indent=2, sort_keys=True) + chr(10) + chr(10) +
         "_K5_SURFACE = {" + chr(10) +
         "    'analyzer_timeout': float," + chr(10) +
@@ -1721,7 +1725,7 @@ def do_daily(work: Path, patch_path: Path, applier_path: Path,
         has_sub = kernel_has_submission_file(ver)
         say("  pushed kernel status: %r (version %s), has submission file: %s"
             % (st, ver, has_sub))
-        if st in ("running", "queued"):
+        if any(w in st for w in ("running", "queued")) or "running" in st or "queued" in st:
             say("")
             say("--- pending row %s (%s) is still running on GPU (status %r) ---"
                 % (pend["exp"], pend["variant"], st))
