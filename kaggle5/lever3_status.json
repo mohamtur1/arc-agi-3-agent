@@ -1,9 +1,0 @@
-{
- "installed": true,
- "module": "inference.agent.tool_agent",
- "gate": false,
- "events": [
-  "watching for inference.agent.tool_agent",
-  "patched inference.agent.tool_agent (gate=False)"
- ]
-}

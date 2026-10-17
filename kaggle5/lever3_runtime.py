@@ -415,8 +415,20 @@ def _patch_module(ta, runtime: _Runtime) -> None:
     # 2) the gate + the recorder, around the sandbox call
     original_sandbox = ta.run_sandboxed_python
 
-    def run_sandboxed_python(*, code, timeout_seconds, initial_state,
-                             action_handler):
+    # Never mirror the upstream signature. The live harness passes an extra
+    # `animation_handler`; a mirrored signature rejected it and every analyzer
+    # call died with TypeError before the model was ever reached. Bind against
+    # the REAL signature instead, change only the three arguments we own, and
+    # forward everything else untouched.
+    import inspect as _inspect
+    _sandbox_sig = _inspect.signature(original_sandbox)
+
+    def run_sandboxed_python(*args, **kwargs):
+        bound = _sandbox_sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        code = bound.arguments.get("code", "")
+        initial_state = bound.arguments.get("initial_state") or {}
+        action_handler = bound.arguments["action_handler"]
         memory, sidecar = runtime.memory_for(runtime.state_path)
         payload = memory.to_payload()
         state = dict(initial_state or {})
@@ -481,10 +493,10 @@ def _patch_module(ta, runtime: _Runtime) -> None:
                 state = new_state
             return out
 
-        return original_sandbox(code=preamble + code,
-                                timeout_seconds=timeout_seconds,
-                                initial_state=state,
-                                action_handler=handler)
+        bound.arguments["code"] = preamble + code
+        bound.arguments["initial_state"] = state
+        bound.arguments["action_handler"] = handler
+        return original_sandbox(*bound.args, **bound.kwargs)
 
     ta.run_sandboxed_python = run_sandboxed_python
 
