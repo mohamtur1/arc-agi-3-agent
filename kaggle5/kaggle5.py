@@ -1463,9 +1463,22 @@ def run_gym_gate(lever_dir: Path, incumbent_knobs: dict, plan: dict) -> dict:
     try:
         data = gym_json(out)
     except ValueError:
+        blob = out + (r.stderr or "")
+        # A missing dependency means the FILTER could not run. That is an
+        # environment fact, not evidence about the variant. Conflating the two
+        # silences the loop forever on any host without the gym's imports
+        # (a clean CI runner, for example), so it gets its own verdict.
+        if "ModuleNotFoundError" in blob or "ImportError" in blob:
+            missing = sorted(set(
+                line.split("No module named", 1)[1].strip().strip("'\"")
+                for line in blob.splitlines() if "No module named" in line))
+            return {"verdict": "UNAVAILABLE",
+                    "verdict_reasons": [
+                        "gym could not run on this host: missing %s"
+                        % (", ".join(m for m in missing if m) or "a dependency"),
+                        blob[-300:]]}
         return {"verdict": "FAIL",
-                "verdict_reasons": ["gym output unreadable",
-                                    (out + (r.stderr or ""))[-300:]]}
+                "verdict_reasons": ["gym output unreadable", blob[-300:]]}
     say("  gym filter (a smoke test, NOT a score): verdict=%s %s"
         % (data.get("verdict"), "; ".join(data.get("verdict_reasons") or [])))
     for tag in ("incumbent", "candidate"):
@@ -1823,6 +1836,13 @@ def do_daily(work: Path, patch_path: Path, applier_path: Path,
                     "summary": {t: {k: (gate.get(t) or {}).get(k)
                                     for k in ("levels", "wins", "wall_seconds")}
                                 for t in ("incumbent", "candidate")}})
+        if gate.get("verdict") == "UNAVAILABLE":
+            say("  " + "!" * 62)
+            say("  FILTER UNAVAILABLE — this says nothing about the variant.")
+            say("  reason: " + "; ".join((gate.get("verdict_reasons") or [""])[:1]))
+            say("  Proceeding WITHOUT the filter, exactly as --skip-gym would.")
+            say("  Install the gym's imports to restore the filter.")
+            say("  " + "!" * 62)
         if gate.get("verdict") == "FAIL":
             say("  FILTERED: %s rejected before spending a day: %s"
                 % (plan["variant"], "; ".join(gate.get("verdict_reasons") or [])))
@@ -2195,6 +2215,43 @@ def _test_static_gate() -> None:
     _t(not ok and "canonically equal" in msg, "canon-equal change refused")
 
 
+def _test_gym_verdicts(lever_dir: Path) -> None:
+    """A filter that cannot run must never be mistaken for a rejection."""
+    say("self-test: gym verdict classification")
+    tmp = Path(tempfile.mkdtemp(prefix="k5_gymv_"))
+    (tmp / AGENT_FILE).write_text("x = 1\n")   # run_gym_gate needs this name
+    plan = {"variant": "t", "knobs": {}, "changed": {"analyzer_timeout": [1.0, 2.0]}}
+
+    gym = tmp / GYM_FILE
+    gym.write_text(
+        "import sys" + chr(10) +
+        "import numpy_that_does_not_exist" + chr(10) +
+        "print('{}')" + chr(10))
+    v = run_gym_gate(tmp, {}, plan)
+    _t(v.get("verdict") == "UNAVAILABLE",
+       "a gym that cannot import its deps is UNAVAILABLE, not FAIL")
+    _t(any("numpy_that_does_not_exist" in str(r)
+           for r in v.get("verdict_reasons") or []),
+       "UNAVAILABLE names the missing module")
+
+    gym.write_text(
+        "import sys" + chr(10) +
+        "sys.stderr.write('Traceback...\nRuntimeError: real crash\n')" +
+        chr(10) + "sys.exit(3)" + chr(10))
+    v = run_gym_gate(tmp, {}, plan)
+    _t(v.get("verdict") == "FAIL",
+       "a gym that really crashes is still FAIL (the filter still bites)")
+
+    gym.write_text(
+        "import json" + chr(10) +
+        "print(json.dumps({'verdict': 'PASS', 'verdict_reasons': [],"
+        " 'incumbent': {'levels': 5, 'wins': 3, 'wall_seconds': 1.0},"
+        " 'candidate': {'levels': 5, 'wins': 3, 'wall_seconds': 1.0}}))" + chr(10))
+    v = run_gym_gate(tmp, {}, plan)
+    _t(v.get("verdict") == "PASS", "a healthy gym still passes")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _test_guards(lever_dir: Path) -> None:
     say("self-test: guards and refusals")
     _src = Path(__file__).read_text()
@@ -2336,6 +2393,7 @@ def self_test(lever_dir: Path) -> None:
     _test_injection()
     _test_ledger_and_planner(Path(tempfile.mkdtemp(prefix="k5_st_")))
     _test_static_gate()
+    _test_gym_verdicts(lever_dir)
     _test_guards(lever_dir)
     _test_stub_end_to_end(lever_dir, Path(tempfile.mkdtemp(prefix="k5_e2e_")))
     say("")
