@@ -5,6 +5,8 @@ Verifies credentials, executes offline self-test, runs the push stage,
 and prints the mobile prompt card for manual app submission.
 """
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +29,61 @@ def verify_credentials() -> None:
     sys.exit(1)
 
 
+def describe_secret(value: str) -> str:
+    """Shape of a credential, never its value."""
+    if not value:
+        return "empty"
+    if re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        return "%d chars, classic-32hex" % len(value)
+    if value.startswith("KGAT_"):
+        return "%d chars, KGAT access token" % len(value)
+    if value.startswith("kaggle"):
+        return "%d chars, unusual (starts with 'kaggle')" % len(value)
+    return "%d chars, unrecognised shape" % len(value)
+
+
+def probe_auth() -> None:
+    """Prove the Kaggle CLI accepts these credentials, not just that they exist.
+
+    A present-but-rejected key is the difference between 'no credentials' and
+    'wrong credentials', and the fix is different. Read-only: lists the user's
+    own kernels, page size 1.
+    """
+    print("=== Step 0: Kaggle Auth Probe ===")
+    print("  KAGGLE_USERNAME   : %s"
+          % describe_secret(os.environ.get("KAGGLE_USERNAME", "")))
+    print("  KAGGLE_KEY        : %s"
+          % describe_secret(os.environ.get("KAGGLE_KEY", "")))
+    print("  KAGGLE_API_TOKEN  : %s"
+          % describe_secret(os.environ.get("KAGGLE_API_TOKEN", "")))
+
+    binary = shutil.which("kaggle")
+    base = [binary] if binary else [sys.executable, "-m", "kaggle"]
+    cmd = base + ["kernels", "list", "--mine", "--page-size", "1"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode == 0:
+        print("  -> Kaggle accepted the credentials (read-only probe OK)")
+        return
+
+    if "Authentication required" in out or "401" in out or "Unauthorized" in out:
+        sys.stderr.write(
+            "\nAUTH PROBE FAILED: the credentials exist but Kaggle REJECTED them.\n"
+            "  Present-but-invalid is not the same as absent, and only you can\n"
+            "  fix it:\n"
+            "    1. Open https://www.kaggle.com/settings/api\n"
+            "    2. 'Generate New Token' -> copy the KGAT_... value\n"
+            "    3. Repo Settings -> Secrets -> Actions -> New secret named\n"
+            "       KAGGLE_API_TOKEN, pasted verbatim\n"
+            "    4. Delete the old KAGGLE_KEY (legacy keys are being retired;\n"
+            "       a stale one makes every run fail here)\n"
+            "  The workflow already passes KAGGLE_API_TOKEN through.\n"
+        )
+    else:
+        sys.stderr.write("\nAUTH PROBE FAILED (unexpected):\n%s\n" % out[-1200:])
+    sys.exit(1)
+
+
 def run_command(cmd: list[str], cwd: Path) -> str:
     """Execute command and stream output, failing loudly on error."""
     res = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
@@ -39,6 +96,7 @@ def run_command(cmd: list[str], cwd: Path) -> str:
 
 def main() -> None:
     verify_credentials()
+    probe_auth()
     repo_root = Path(__file__).resolve().parent
     k5_dir = repo_root / "kaggle5"
     variant = os.environ.get("K5_VARIANT", "lever3").strip() or "lever3"
