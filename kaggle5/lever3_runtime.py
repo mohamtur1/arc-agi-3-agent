@@ -106,6 +106,16 @@ def _num(value) -> str:
         return str(value).strip()
 
 
+def _field(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    if isinstance(obj, (list, tuple)) and obj:
+        last = obj[-1]
+        if isinstance(last, dict):
+            return last.get(key, default)
+    return default
+
+
 def action_key(action) -> str:
     if isinstance(action, dict):
         name = str(action.get("action") or "").strip().upper()
@@ -143,19 +153,22 @@ class CompactStateGraph:
         b = state_hash(before, level)
         a = state_hash(after, level)
         edge = self.states.setdefault(b, {})
-        prior = edge.get(name)
+        if not isinstance(edge, dict):
+            edge = {}
+            self.states[b] = edge
+        prior = edge.get(name) if isinstance(edge, dict) else None
         if result.get("game_over"):
             outcome = "dead_end"
         elif b == a or result.get("board_changed") is False:
             outcome = "no_op"
         elif result.get("level_completed") or result.get("run_complete"):
             outcome = "progress"
-        elif prior is not None and prior.get("next") == a:
+        elif prior is not None and _field(prior, "next") == a:
             outcome = "loop"
         else:
             outcome = "active"
         edge[name] = {"next": a, "outcome": outcome,
-                      "count": int((prior or {}).get("count", 0)) + 1}
+                      "count": int(_field(prior, "count", 0)) + 1}
         while len(edge) > MAX_EDGES_PER_STATE:
             edge.pop(next(iter(edge)))
         if outcome == "dead_end" and a not in self.dead_ends:
@@ -173,12 +186,17 @@ class CompactStateGraph:
 
     def is_pruned(self, h, action) -> bool:
         key = str(h)
-        rec = self.states.get(key, {}).get(action_key(action))
-        if rec is None:
+        rec = self.states.get(key, {})
+        if not isinstance(rec, dict):
             return False
-        return (rec.get("outcome") in PRUNED
-                or rec.get("next") in self.dead_ends
-                or rec.get("next") == key)
+        edge = rec.get(action_key(action))
+        if edge is None:
+            return False
+        outcome = _field(edge, "outcome")
+        nxt = _field(edge, "next")
+        return (outcome in PRUNED
+                or nxt in self.dead_ends
+                or nxt == key)
 
     def safe_actions(self, h, valid) -> list:
         return [a for a in (valid or []) if not self.is_pruned(h, a)]
@@ -400,7 +418,8 @@ def _patch_module(ta, runtime: _Runtime) -> None:
         return
 
     # 1) which game directory is live
-    original_run = ta.ToolAgent._run_python_tool
+    original_run = getattr(ta.ToolAgent, "_k5_orig_run", ta.ToolAgent._run_python_tool)
+    ta.ToolAgent._k5_orig_run = original_run
 
     def _run_python_tool(self, state_path, arguments):
         previous = runtime.state_path
@@ -413,7 +432,8 @@ def _patch_module(ta, runtime: _Runtime) -> None:
     ta.ToolAgent._run_python_tool = _run_python_tool
 
     # 2) the gate + the recorder, around the sandbox call
-    original_sandbox = ta.run_sandboxed_python
+    original_sandbox = getattr(ta, "_k5_orig_sandbox", ta.run_sandboxed_python)
+    ta._k5_orig_sandbox = original_sandbox
 
     # Never mirror the upstream signature. The live harness passes an extra
     # `animation_handler`; a mirrored signature rejected it and every analyzer
@@ -455,7 +475,7 @@ def _patch_module(ta, runtime: _Runtime) -> None:
                                      for t in refusal["tried"]) or "none"))
                     result = {
                         "executed": False,
-                        "action_num": (state.get("last_action_result") or {}).get("action_num"),
+                        "action_num": _field(state.get("last_action_result"), "action_num"),
                         "level": level, "score": None, "reward": 0.0,
                         "state": None, "valid_actions": list(valid),
                         "board_changed": False, "done": False,
@@ -475,9 +495,18 @@ def _patch_module(ta, runtime: _Runtime) -> None:
             out = action_handler(actions)
             if not isinstance(out, dict):
                 return out
-            result = out.get("action_result") or {}
+            raw_res = out.get("action_result")
+            if isinstance(raw_res, dict):
+                result = raw_res
+            elif isinstance(raw_res, (list, tuple)) and raw_res:
+                last_item = raw_res[-1]
+                result = last_item if isinstance(last_item, dict) else {}
+            else:
+                result = {}
+
             new_state = out.get("state")
-            after = _ascii_text((new_state or {}).get("current_frame"))
+            current_frame = new_state.get("current_frame") if isinstance(new_state, dict) else None
+            after = _ascii_text(current_frame)
             if (len(actions or []) == 1 and before and after
                     and isinstance(result, dict)
                     and result.get("executed", True) is not False):
@@ -485,7 +514,7 @@ def _patch_module(ta, runtime: _Runtime) -> None:
                 memory.save(sidecar)
             if after:
                 before = after
-                level = _level_of((new_state or {}).get("current_frame"))
+                level = _level_of(current_frame)
             if isinstance(new_state, dict):
                 if isinstance(new_state.get("valid_actions"), list):
                     valid = list(new_state["valid_actions"])

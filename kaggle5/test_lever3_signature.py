@@ -49,7 +49,7 @@ def fresh_harness(sandbox_fn, name="inference.agent.tool_agent"):
 FRAME = {"ascii": "AAA\nABA\nAAA", "level": 1, "step": 0,
          "shape": [3, 3], "grid": [[0, 0, 0], [0, 1, 0], [0, 0, 0]]}
 INITIAL = {"current_frame": FRAME, "history": [], "valid_actions": ["UP", "DOWN"],
-           "last_action_result": {}}
+           "last_action_result": [{"action_num": 1, "executed": True}]}
 
 
 print("\n[1] a harness that passes animation_handler (the live shape)")
@@ -119,6 +119,27 @@ sys.modules["inference.agent.tool_agent"].run_sandboxed_python(
                                     "state": dict(INITIAL)},
 )
 check(called.get("yes") is True, "narrow signature still works")
+
+print("\n[4] defensive handling when last_action_result is a list (live regression)")
+seen.clear()
+fresh_harness(live_shaped)
+runtime4 = lever3_runtime.install(gate=True)
+state_path4 = Path(tempfile.mkdtemp()) / "game" / "tool_runtime_state.json"
+state_path4.parent.mkdir(parents=True)
+runtime4.state_path = state_path4
+runtime4.memory_for(state_path4)[0].observe(
+    FRAME["ascii"], 1, {"action": "UP"},
+    {"executed": True, "board_changed": False}, FRAME["ascii"])
+
+list_state = dict(INITIAL)
+list_state["last_action_result"] = [{"action_num": 7, "executed": True}]
+sys.modules["inference.agent.tool_agent"].run_sandboxed_python(
+    code="pass", timeout_seconds=30, initial_state=list_state,
+    action_handler=lambda actions: {"action_result": {"executed": True},
+                                    "state": list_state},
+    animation_handler=None,
+)
+check(seen.get("stop_reason") == "k5_pruned", "gate pruned successfully with list last_action_result")
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
