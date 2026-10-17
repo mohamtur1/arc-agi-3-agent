@@ -505,6 +505,17 @@ def _patch_module(ta, runtime: _Runtime) -> None:
     runtime.patched_module = ta.__name__
     runtime.installed = True
     runtime.events.append("patched %s (gate=%s)" % (ta.__name__, runtime.gate))
+    # Visible in the notebook stream at the moment the harness loads, and
+    # written to disk so the outcome shows up in the kernel's output files.
+    print("[k5] lever 3: PATCHED %s (gate=%s) -- episodic memory is live"
+          % (ta.__name__, runtime.gate))
+    try:
+        status = Path(__file__).resolve().parent / "lever3_status.json"
+        status.write_text(json.dumps(
+            {"installed": True, "module": ta.__name__, "gate": runtime.gate,
+             "events": runtime.events}, indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
 
 class _WatchingLoader(importlib.abc.Loader):

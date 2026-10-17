@@ -93,6 +93,29 @@ driver = (HERE / "kaggle5.py").read_text()
 patch = (HERE / "lever2-grid.patch").read_text()
 applier = (HERE / "lever3_apply.py").read_text()
 shim = (HERE / "lever3_runtime.py").read_text()
+
+# The applier carries the shim as base64, because the GPU kernel receives only
+# the patch cell and the applier cell and has no internet. Fail loudly rather
+# than ship an applier holding an older shim than the one beside it.
+import base64 as _b64
+import hashlib as _hl
+import re as _re
+_b64_block = _re.search(r'SHIM_B64 = "([A-Za-z0-9+/=]*)"  # k5-shim-b64',
+                        applier)
+_sha_block = _re.search(r'SHIM_SHA256 = "([0-9a-f]{64})"  # k5-shim-sha',
+                        applier)
+if not _b64_block or not _sha_block:
+    raise SystemExit("lever3_apply.py is missing its SHIM_B64/SHIM_SHA256 block; "
+                     "run kaggle5/sync_shim.py")
+_baked = _b64.b64decode(_b64_block.group(1))
+_actual = _hl.sha256(shim.encode()).hexdigest()
+if _hl.sha256(_baked).hexdigest() != _hl.sha256(shim.encode()).hexdigest():
+    raise SystemExit("STALE SHIM — lever3_apply.py carries a different "
+                     "lever3_runtime.py than the one beside it.\n"
+                     "  baked: %s\n  on disk: %s\n"
+                     "  Run: python kaggle5/sync_shim.py"
+                     % (_hl.sha256(_baked).hexdigest()[:16], _actual[:16]))
+print("applier carries the current shim: sha256 %s…" % _actual[:16])
 gym = (HERE / "k5_gym.py").read_text()
 
 # lever2-grid.patch is a FIXED artifact (byte-identical to
