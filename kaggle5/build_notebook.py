@@ -4,7 +4,7 @@
 Sources
   kaggle5.py                 the driver (embedded + fetched at run time)
   lever2-grid.patch          the lever (fixed artifact; never retyped)
-  lever2_apply.py            the applier cell
+  lever3_apply.py            the applier cell (lever-2 grid + lever-3 memory)
   k5_gym.py                 the local filter gym
   program_synthesis_agent_v4.py  the agent, mirrored from 4CBOn2/Kaggle at
                              build time and PINNED by the sha256 inside
@@ -90,14 +90,14 @@ def embed(name: str, body: str) -> dict:
 
 driver = (HERE / "kaggle5.py").read_text()
 patch = (HERE / "lever2-grid.patch").read_text()
-applier = (HERE / "lever2_apply.py").read_text()
+applier = (HERE / "lever3_apply.py").read_text()
 gym = (HERE / "k5_gym.py").read_text()
 
 # lever2-grid.patch is a FIXED artifact (byte-identical to
 # 4CBOn2/Kaggle/franzen-grid-interface.patch). It is never retyped,
 # reformatted or rewrapped, so its digest is pinned here and the build
 # fails loudly on any drift — including a one-byte accident.
-PATCH_SHA256 = "143ae716d99374cccbe6f25b607c3f6bf6e2eb9fa50299b9a05ff5e3cfd09b69"
+PATCH_SHA256 = "eb25c2d6480ed36eba40e9a05bc358ac2d59995856604d0023d0d67f62bb2cc9"
 if hashlib.sha256(patch.encode()).hexdigest() != PATCH_SHA256:
     raise SystemExit(
         "LEVER PATCH DRIFT — refusing to build. lever2-grid.patch is a fixed\n"
@@ -149,7 +149,7 @@ if r.returncode != 0:
                      + r.stdout + r.stderr)
 print("preflight: kaggle5.py --self-test passed")
 
-fetch_list = [f for f in ("kaggle5.py", "lever2-grid.patch", "lever2_apply.py",
+fetch_list = [f for f in ("kaggle5.py", "lever2-grid.patch", "lever3_apply.py",
                           "k5_gym.py")]
 
 # --------------------------------------------------------------------------
@@ -219,7 +219,7 @@ cells = [
        " the sha256 of whatever bytes are in play."),
     embed("kaggle5.py", driver),
     embed("lever2-grid.patch", patch),
-    embed("lever2_apply.py", applier),
+    embed("lever3_apply.py", applier),
     embed("k5_gym.py", gym),
     embed(agent_name, agent),
 
@@ -360,11 +360,11 @@ def extract(name: str) -> str:
 
 
 d = extract("kaggle5.py")
-a = extract("lever2_apply.py")
+a = extract("lever3_apply.py")
 pb = extract("lever2-grid.patch")
 g = extract("k5_gym.py")
 ag = extract(agent_name)
-for label, text in (("kaggle5.py", d), ("lever2_apply.py", a),
+for label, text in (("kaggle5.py", d), ("lever3_apply.py", a),
                     ("k5_gym.py", g), (agent_name, ag)):
     compile(text, label, "exec")
 assert d.strip() == driver.strip(), "embedded driver differs from source"

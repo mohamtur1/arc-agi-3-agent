@@ -599,6 +599,31 @@ def lever_cells_present(nb: dict, lever_tag: str) -> list[int]:
     return out
 
 
+VARIANT_LINE = 'VARIANT = "lever3"  # k5-variant-line'
+
+
+def set_variant(nb: dict, variant: str) -> dict:
+    """Bake the requested variant into the applier cell (idempotent).
+
+    lever3 : memory + hard prune gate + prompt directives (default)
+    kernel : memory view present, gate off, prompt untouched (A/B rollback)
+    """
+    if variant == "lever3":
+        return nb
+    anchor = lever_anchor(nb, LEVER_TAG)
+    if anchor is None:
+        die("variant rewrite: no applier cell found in the pulled notebook")
+    cell = nb["cells"][anchor]
+    src = cell_text(cell)
+    if VARIANT_LINE not in src:
+        die("variant rewrite: the applier cell has no %r line; refusing to "
+            "rewrite blindly" % VARIANT_LINE)
+    cell["source"] = src.replace(
+        VARIANT_LINE, 'VARIANT = "%s"  # k5-variant-line' % variant, 1)
+    say("  variant=%s baked into the applier cell" % variant)
+    return nb
+
+
 def build_lever_cells(patch_text: str, applier: str, lever_tag: str) -> list[dict]:
     if ("'" * 3) in patch_text:
         die(LEVER_PATCH_FILE
@@ -1536,7 +1561,8 @@ def print_human_card(plan: dict, version: int, today: str) -> None:
 
 
 def do_check(work: Path, patch_path: Path, applier_path: Path,
-             inject_at: int | None, lever_dir: Path) -> None:
+             inject_at: int | None, lever_dir: Path,
+             variant: str = "lever3") -> None:
     probe_cli_flags()
     guard_agent_file(lever_dir)
     check_defaults_drift(lever_dir)
@@ -1579,6 +1605,7 @@ def do_check(work: Path, patch_path: Path, applier_path: Path,
             "knobs": dict(DEFAULT_KNOBS, EXPLORATION_CAP=24)}
     nb2 = inject(nb, patch_path.read_text(), applier, LEVER_TAG, inject_at,
                  knob_payload=knob_payload_for(demo, local_today()))
+    nb2 = set_variant(nb2, variant)
     verify_injection(nb2, patch_path.read_text(), LEVER_TAG,
                      knob_payload=knob_payload_for(demo, local_today()))
     where = lever_cells_present(nb2, LEVER_TAG)
@@ -1592,7 +1619,8 @@ def do_check(work: Path, patch_path: Path, applier_path: Path,
 
 def do_push(work: Path, patch_path: Path, applier_path: Path,
             inject_at: int | None, allow_same: bool,
-            plan: dict | None = None, allow_inert: bool = False) -> int:
+            plan: dict | None = None, allow_inert: bool = False,
+            variant: str = "lever3") -> int:
     patch_text = patch_path.read_text() if patch_path.is_file() else ""
     applier = applier_path.read_text() if applier_path.is_file() else ""
     if not patch_text.strip():
@@ -1625,6 +1653,7 @@ def do_push(work: Path, patch_path: Path, applier_path: Path,
     before = json.dumps(nb, sort_keys=True)
     nb2 = inject(nb, patch_text, applier, LEVER_TAG, inject_at,
                  knob_payload=knob_payload)
+    nb2 = set_variant(nb2, variant)
     verify_injection(nb2, patch_text, LEVER_TAG, knob_payload=knob_payload)
 
     if before == json.dumps(nb2, sort_keys=True):
@@ -1681,7 +1710,7 @@ def refuse_submit(stage: str) -> None:
 
 def do_daily(work: Path, patch_path: Path, applier_path: Path,
              inject_at: int | None, lever_dir: Path, skip_gym: bool,
-             allow_inert: bool) -> None:
+             allow_inert: bool, variant: str = "lever3") -> None:
     """The scheduled loop. Idempotent within a day; safe to interrupt at
     any line; never submits."""
     today = local_today()
@@ -1809,7 +1838,8 @@ def do_daily(work: Path, patch_path: Path, applier_path: Path,
     led.append(ev)
     led.sync_out("pending %s for %s (pre-push)" % (ev["exp"], today))
     version = do_push(work, patch_path, applier_path, inject_at,
-                      allow_same=False, plan=plan, allow_inert=allow_inert)
+                      allow_same=False, plan=plan, allow_inert=allow_inert,
+                      variant=variant)
     led.append({"kind": "pushed", "exp": ev["exp"], "version": version})
     led.sync_out("pushed v%d for %s" % (version, ev["exp"]))
     say("PUSHED version %d of %s/%s" % (version, OWNER, KERNEL_SLUG))
@@ -1891,9 +1921,10 @@ PATCH = ("diff --git a/ARC3-Inference/inference/agent/prompts.py "
          '+    "- `current_frame.grid` is the exact numeric color grid.\\n"\n')
 
 APPLIER = ("import subprocess\n"
+           "VARIANT = \"lever3\"  # k5-variant-line\n"
            "subprocess.run(['git', 'apply', '-v', str(PATCH)], "
            "cwd=str(BUNDLE_DIR / 'src'), check=True)\n"
-           "print('lever 2 applied')\n")
+           "print('lever 3 applied')\n")
 
 
 def _fixture() -> dict:
@@ -1952,6 +1983,20 @@ def _test_injection() -> None:
                "knobs": dict(DEFAULT_KNOBS, analyzer_timeout=1200.0)}
     nb3 = inject(nb, PATCH, APPLIER, LEVER_TAG, knob_payload=payload)
     verify_injection(nb3, PATCH, LEVER_TAG, knob_payload=payload)
+
+    # variant baking: lever3 is a no-op, kernel rewrites exactly one line
+    anchor = lever_anchor(nb3, LEVER_TAG)
+    before_src = cell_text(nb3["cells"][anchor])
+    _t('VARIANT = "lever3"' in before_src, "applier cell carries the variant line")
+    nb_kept = set_variant(json.loads(json.dumps(nb3)), "lever3")
+    _t(cell_text(nb_kept["cells"][lever_anchor(nb_kept, LEVER_TAG)]) == before_src,
+       "variant=lever3 leaves the applier cell byte-identical")
+    nb_kernel = set_variant(json.loads(json.dumps(nb3)), "kernel")
+    kernel_src = cell_text(nb_kernel["cells"][lever_anchor(nb_kernel, LEVER_TAG)])
+    _t('VARIANT = "kernel"' in kernel_src and 'VARIANT = "lever3"' not in kernel_src,
+       "variant=kernel bakes the kernel variant into the applier cell")
+    _t(kernel_src.count("k5-variant-line") == 1,
+       "variant rewrite does not duplicate the marker")
 
     # hook placement test
     h_idx = find_hook_heading(nb3)
@@ -2187,7 +2232,7 @@ def _test_guards(lever_dir: Path) -> None:
 def _test_stub_end_to_end(lever_dir: Path, tmp: Path) -> None:
     say("self-test: multi-day offline end-to-end against _stub_kaggle.py")
     stub = lever_dir / "_stub_kaggle.py"
-    for f in (stub, lever_dir / LEVER_PATCH_FILE, lever_dir / "lever2_apply.py"):
+    for f in (stub, lever_dir / LEVER_PATCH_FILE, lever_dir / "lever3_apply.py"):
         if not f.is_file():
             say("  stub end-to-end: SKIPPED (%s missing beside kaggle5.py)"
                 % f.name)
@@ -2315,6 +2360,9 @@ def main() -> None:
     ap.add_argument("--skip-gym", action="store_true")
     ap.add_argument("--set", action="append", default=[],
                     metavar="KNOB=JSON", help="ad-hoc override for stage=gym/push")
+    ap.add_argument("--variant", default="lever3", choices=["lever3", "kernel"],
+                    help="lever3 = memory + hard prune gate (default); "
+                         "kernel = memory present, gate off, prompt untouched")
     ap.add_argument("--abandon", action="store_true",
                     help="tombstone the current pending row (human decided "
                          "not to submit it) and exit")
@@ -2328,7 +2376,7 @@ def main() -> None:
         Path(__file__).resolve().parent
         if Path(__file__).resolve().parent.is_dir() else Path.cwd())
     patch_path = lever_dir / LEVER_PATCH_FILE
-    applier_path = lever_dir / "lever2_apply.py"
+    applier_path = lever_dir / "lever3_apply.py"
 
     if a.self_test:
         self_test(lever_dir)
@@ -2354,7 +2402,8 @@ def main() -> None:
         return
 
     if a.stage == "check":
-        do_check(work, patch_path, applier_path, a.inject_at, lever_dir)
+        do_check(work, patch_path, applier_path, a.inject_at, lever_dir,
+                 variant=a.variant)
     elif a.stage == "plan":
         do_plan(lever_dir, work, local_today())
     elif a.stage == "gym":
@@ -2381,7 +2430,8 @@ def main() -> None:
             led.append(ev)
             led.sync_out("manual pending %s" % ev["exp"])
             ver = do_push(work, patch_path, applier_path, a.inject_at,
-                          a.allow_same, plan=plan, allow_inert=a.allow_inert)
+                          a.allow_same, plan=plan, allow_inert=a.allow_inert,
+                          variant=a.variant)
             led.append({"kind": "pushed", "exp": ev["exp"], "version": ver})
             led.sync_out("manual pushed v%d" % ver)
             print_human_card(plan, ver, local_today())
@@ -2389,14 +2439,15 @@ def main() -> None:
             say("note: lever-only repush, OUTSIDE the experiment loop "
                 "(no pending row written).")
             ver = do_push(work, patch_path, applier_path, a.inject_at,
-                          a.allow_same)
+                          a.allow_same, variant=a.variant)
             say("PUSHED version %d. The loop is untouched; use --set to push "
                 "an ad-hoc experiment instead." % ver)
     elif a.stage == "score":
         do_score_read(lever_dir, work, local_today())
     elif a.stage == "daily":
         do_daily(work, patch_path, applier_path, a.inject_at, lever_dir,
-                 skip_gym=a.skip_gym, allow_inert=a.allow_inert)
+                 skip_gym=a.skip_gym, allow_inert=a.allow_inert,
+                 variant=a.variant)
     elif a.stage in ("submit", "all"):
         refuse_submit(a.stage)
 

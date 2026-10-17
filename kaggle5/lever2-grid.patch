@@ -1,109 +1,672 @@
 diff --git a/ARC3-Inference/README.md b/ARC3-Inference/README.md
-index 3674ea5..9a9e10f 100644
+index 07542dd..9f95aa3 100644
 --- a/ARC3-Inference/README.md
 +++ b/ARC3-Inference/README.md
-@@ -83,7 +83,7 @@ plan, and execute real game actions with `action(...)`.
+@@ -64,6 +64,9 @@ duck inspects the board, writes small bits of code to reason about it, and calls
+ The duck can use:
  
- | Name | Meaning |
- | --- | --- |
--| `current_frame` | Latest board, exposing `.ascii`, `.segmentation`, `.shape`, `.step`, and `.level`. `.shape` is `(rows, cols)`. |
-+| `current_frame` | Latest board, exposing `.ascii`, `.grid`, `.segmentation`, `.shape`, `.step`, and `.level`. `.shape` is `(rows, cols)`; `.grid[row][col]` is the numeric color ID at that cell. |
- | `previous_frame` | Board before the most recent recorded action, when available. |
- | `history` | Recorded states and actions. `history[-1].frame` is the current, post-action board. |
- | `transitions` | Individual executed actions, each with `.action`, `.before_frame`, `.after_frame`, and retained `.result` metadata. |
-@@ -94,8 +94,10 @@ plan, and execute real game actions with `action(...)`.
+ - `current_frame.ascii` for a compact symbolic grid
++- `current_frame.grid` for the exact numeric color IDs (`grid[row][col]`)
++- `current_frame.memory` for the deterministic episodic state graph:
++  transitions already tried, and the no-op / dead-end / loop pruning gate
+ - `current_frame.segmentation` for connected components, object hashes,
+   boundaries, containment, and adjacency
+ - `history`, `previous_frame`, `transitions`, and `last_transition` for
+@@ -72,9 +75,10 @@ The duck can use:
+ - `last_action_result` for fields such as `board_changed`, `level_completed`,
+   `game_over`, `run_complete`, and `reward`
  
- Segmentation uses same-color, 4-connected components. Components and their
- cross-frame matches are geometric descriptions, not guaranteed game-object
--identities. The raw numeric grid is not exposed; `.ascii` provides the symbolic
--grid and `.segmentation` provides objects, boundaries, containment, and adjacency.
-+identities. `.grid` is an immutable tuple of numeric color-ID rows for exact
-+cell-level checks; `.ascii` provides a symbolic view and `.segmentation` provides
-+objects, boundaries, containment, and adjacency. Prefer compact computed
-+summaries to printing an entire grid.
+-The raw numeric grid is intentionally hidden from the Python tool. The preferred
+-view is `current_frame.segmentation`; `current_frame.ascii` is there for small
+-local checks.
++The raw numeric grid is available as `current_frame.grid` for exact cell-level
++checks and state hashing. The preferred view is still
++`current_frame.segmentation`; `current_frame.ascii` is there for small local
++checks, and `current_frame.memory` carries the run's transition history.
  
- `action(...)` returns `last_action_call_result` and refreshes the provided
- runtime state before the next Python statement. Inspection-only calls retain
+ The model-facing actions are:
+ 
+diff --git a/ARC3-Inference/inference/agent/episodic_memory.py b/ARC3-Inference/inference/agent/episodic_memory.py
+new file mode 100644
+index 0000000..7968369
+--- /dev/null
++++ b/ARC3-Inference/inference/agent/episodic_memory.py
+@@ -0,0 +1,315 @@
++"""Deterministic episodic state memory for the ARC-3 tool agent (Lever-3).
++
++The Python tool sandbox is a *fresh subprocess on every call* (see
++``run_sandboxed_python``), so any object created inside it dies with the call.
++The only durable place for episodic memory is here, on the host, next to
++``tool_runtime_state.json`` -- the one place that observes every real
++``action(...)`` transition and survives across tool calls.
++
++Design rules
++  * deterministic: 64-bit FNV-1a hashes, no randomness, no clocks, no floats
++  * bounded: capped states/edges, oldest evicted first
++  * JSON-serialisable, so it can be persisted to disk and sent to the sandbox
++  * advisory to the model, authoritative at the gate: ``action()`` refuses a
++    known no-op / dead-end / loop edge, unless every valid action would be
++    refused -- the escape hatch that stops a level from ever bricking
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++MEMORY_FILENAME = "tool_episodic_memory.json"
++MEMORY_VERSION = 1
++
++# Set False to keep the memory view available but advisory (rollback variant).
++EPISODIC_MEMORY_GATE = True
++
++MAX_STATES = 512
++MAX_EDGES_PER_STATE = 12
++MAX_DEAD_ENDS = 512
++SNAPSHOT_MAX_STATES = 256
++SNAPSHOT_MAX_EDGES_PER_STATE = 8
++
++PRUNED_OUTCOMES = ("no_op", "dead_end", "loop")
++
++_FNV_OFFSET = 0xCBF29CE484222325
++_FNV_PRIME = 0x100000001B3
++_MASK64 = 0xFFFFFFFFFFFFFFFF
++_ROW_SALT = 0x2C
++_LEVEL_SALT = 0x9E3779B97F4A7C15
++
++
++def _mix(h: int, byte: int) -> int:
++    h ^= byte & 0xFF
++    return (h * _FNV_PRIME) & _MASK64
++
++
++def grid_hash(grid: Any, level: int = 0) -> int:
++    """Order-sensitive 64-bit FNV-1a over a numeric grid, salted by level.
++
++    Salting with the level keeps an identical board from two different levels
++    (common: a small repeated layout) from sharing one memory node.
++    """
++    h = (_FNV_OFFSET ^ ((int(level) & 0xFFFF) * _LEVEL_SALT)) & _MASK64
++    if not grid:
++        return h
++    for row in grid:
++        for cell in row:
++            try:
++                value = int(cell)
++            except (TypeError, ValueError):
++                value = 0
++            h = _mix(h, value)
++        h = _mix(h, _ROW_SALT)
++    return h
++
++
++def number_text(value: Any) -> str:
++    try:
++        return str(int(value))
++    except (TypeError, ValueError):
++        return str(value).strip()
++
++
++def action_key(action: Any) -> str:
++    """Canonical action identity. Must match ``MemoryView._action_key``."""
++    if isinstance(action, dict):
++        name = str(action.get("action", "") or "").strip().upper()
++        parts = [name or "?"]
++        if action.get("row") is not None:
++            parts.append("R%s" % number_text(action.get("row")))
++        if action.get("col") is not None:
++            parts.append("C%s" % number_text(action.get("col")))
++        return "|".join(parts)
++    return str(action or "").strip().upper()
++
++
++def action_name(action: Any) -> str:
++    """Just the action verb: 'MOUSE|R0|C0' -> 'MOUSE', 'LEFT' -> 'LEFT'."""
++    return action_key(action).split("|", 1)[0]
++
++
++def hash_key(value: Any) -> str:
++    """Normalise a state hash (int or hex string) to its 16-char JSON key."""
++    if isinstance(value, bool):
++        return str(int(value))
++    if isinstance(value, int):
++        return "%016x" % (value & _MASK64)
++    return str(value or "").strip().lower()
++
++
++class CompactStateGraph:
++    """Transition memory: (h(S_t), a_t) -> h(S_t+1), with outcome labels."""
++
++    def __init__(self) -> None:
++        self.states: dict[str, dict[str, dict[str, Any]]] = {}
++        self.dead_ends: list[str] = []
++        self.visits: dict[str, int] = {}
++        self.stats: dict[str, int] = {
++            "no_op": 0,
++            "dead_end": 0,
++            "loop": 0,
++            "progress": 0,
++            "active": 0,
++            "overrides": 0,
++            "pruned_calls": 0,
++        }
++
++    # ------------------------------------------------------------------ write
++    def observe(
++        self,
++        before_frame: Any,
++        action: Any,
++        result: dict[str, Any],
++        after_frame: Any,
++    ) -> str | None:
++        """Record one executed ``action`` and return its outcome label."""
++        if before_frame is None or after_frame is None:
++            return None
++        if not isinstance(result, dict) or not result.get("executed", True):
++            return None
++        name = action_key(action)
++        if not name:
++            return None
++
++        before_key = hash_key(grid_hash(before_frame.grid, before_frame.level))
++        after_key = hash_key(grid_hash(after_frame.grid, after_frame.level))
++
++        edge = self.states.setdefault(before_key, {})
++        prior = edge.get(name)
++        outcome = self._classify(before_key, after_key, prior, result)
++
++        edge[name] = {
++            "next": after_key,
++            "outcome": outcome,
++            "count": int((prior or {}).get("count", 0)) + 1,
++        }
++        while len(edge) > MAX_EDGES_PER_STATE:
++            edge.pop(next(iter(edge)))
++        if outcome == "dead_end" and after_key not in self.dead_ends:
++            self.dead_ends.append(after_key)
++            del self.dead_ends[:-MAX_DEAD_ENDS]
++        self.visits[before_key] = self.visits.get(before_key, 0) + 1
++        self.stats[outcome] = self.stats.get(outcome, 0) + 1
++        self._evict()
++        return outcome
++
++    def _classify(
++        self,
++        before_key: str,
++        after_key: str,
++        prior: dict[str, Any] | None,
++        result: dict[str, Any],
++    ) -> str:
++        if result.get("game_over"):
++            return "dead_end"
++        if before_key == after_key or result.get("board_changed") is False:
++            return "no_op"
++        if result.get("level_completed") or result.get("run_complete"):
++            return "progress"
++        if prior is not None and prior.get("next") == after_key:
++            return "loop"
++        return "active"
++
++    def _evict(self) -> None:
++        while len(self.states) > MAX_STATES:
++            self.states.pop(next(iter(self.states)))
++
++    # ------------------------------------------------------------------- read
++    def tried(self, state_hash: Any) -> list[dict[str, Any]]:
++        entries = self.states.get(hash_key(state_hash), {})
++        return [
++            {
++                "action": name,
++                "next": record.get("next"),
++                "outcome": record.get("outcome"),
++                "count": record.get("count"),
++            }
++            for name, record in entries.items()
++        ]
++
++    def is_pruned(self, state_hash: Any, action: Any) -> bool:
++        key = hash_key(state_hash)
++        record = self.states.get(key, {}).get(action_key(action))
++        if record is None:
++            return False
++        if record.get("outcome") in PRUNED_OUTCOMES:
++            return True
++        if record.get("next") in self.dead_ends:
++            return True
++        return record.get("next") == key
++
++    def safe_actions(self, state_hash: Any, valid_actions: Any) -> list[Any]:
++        return [
++            action
++            for action in (valid_actions or [])
++            if not self.is_pruned(state_hash, action)
++        ]
++
++    def gate(
++        self,
++        before_grid: Any,
++        before_level: int,
++        requested: Any,
++        valid_actions: Any,
++    ) -> dict[str, Any] | None:
++        """Return a refusal describing why, or None to let the action through."""
++        if not EPISODIC_MEMORY_GATE or not valid_actions or not requested:
++            return None
++        key = hash_key(grid_hash(before_grid, before_level))
++        # Police by verb, not by full key: a valid_actions list carries plain
++        # names ("MOUSE"), while a recorded edge may carry coordinates
++        # ("MOUSE|r0|c0"). Name matching keeps coordinate actions in scope.
++        valid_names = {action_name(action) for action in valid_actions}
++        requested_keys = [action_key(action) for action in requested]
++        considered = [name for name in requested_keys if action_name(name) in valid_names]
++        if not considered:
++            return None  # not ours to police: let the environment reject it
++        blocked = [name for name in considered if self.is_pruned(key, name)]
++        if not blocked:
++            return None
++        safe = self.safe_actions(key, valid_actions)
++        if not safe:
++            # Every legal action is pruned. Never brick the level: allow it,
++            # and keep the honest record that the gate stood down.
++            self.stats["overrides"] = self.stats.get("overrides", 0) + 1
++            return None
++        self.stats["pruned_calls"] = self.stats.get("pruned_calls", 0) + 1
++        return {"blocked": blocked, "safe_actions": safe, "tried": self.tried(key)}
++
++    # --------------------------------------------------------------- snapshot
++    def to_payload(self) -> dict[str, Any]:
++        keys = list(self.states.keys())[-SNAPSHOT_MAX_STATES:]
++        states: dict[str, Any] = {}
++        for key in keys:
++            rows = list(self.states[key].items())[-SNAPSHOT_MAX_EDGES_PER_STATE:]
++            states[key] = [
++                [name, record.get("next"), record.get("outcome"), record.get("count", 1)]
++                for name, record in rows
++            ]
++        return {
++            "version": MEMORY_VERSION,
++            "states": states,
++            "dead_ends": list(self.dead_ends[-MAX_DEAD_ENDS:]),
++            "stats": dict(self.stats),
++        }
++
++    @classmethod
++    def from_payload(cls, payload: Any) -> "CompactStateGraph":
++        memory = cls()
++        if not isinstance(payload, dict):
++            return memory
++        for key, rows in (payload.get("states") or {}).items():
++            if not isinstance(rows, (list, tuple)):
++                continue
++            edges: dict[str, dict[str, Any]] = {}
++            for row in rows:
++                if not isinstance(row, (list, tuple)) or len(row) < 3:
++                    continue
++                try:
++                    count = int(row[3])
++                except (IndexError, TypeError, ValueError):
++                    count = 1
++                edges[str(row[0])] = {
++                    "next": str(row[1]),
++                    "outcome": str(row[2]),
++                    "count": count,
++                }
++            if edges:
++                memory.states[str(key)] = edges
++        memory.dead_ends = [str(item) for item in (payload.get("dead_ends") or [])]
++        stats = payload.get("stats")
++        if isinstance(stats, dict):
++            for name, value in stats.items():
++                if isinstance(value, (int, float)) and not isinstance(value, bool):
++                    memory.stats[str(name)] = int(value)
++        memory._evict()
++        return memory
++
++    def save(self, path: Path | None) -> None:
++        if path is None:
++            return
++        try:
++            path.parent.mkdir(parents=True, exist_ok=True)
++            tmp = path.with_suffix(path.suffix + ".tmp")
++            tmp.write_text(json.dumps(self.to_payload(), indent=1), encoding="utf-8")
++            tmp.replace(path)
++        except OSError:
++            pass  # memory is an optimisation, never a crash source
++
++    @classmethod
++    def load(cls, path: Path | None) -> "CompactStateGraph":
++        if path is None or not path.is_file():
++            return cls()
++        try:
++            return cls.from_payload(json.loads(path.read_text(encoding="utf-8")))
++        except (OSError, ValueError):
++            return cls()
++
++    def __len__(self) -> int:
++        return sum(len(edges) for edges in self.states.values())
++
++    def __str__(self) -> str:
++        return "CompactStateGraph(states=%d, edges=%d)" % (len(self.states), len(self))
 diff --git a/ARC3-Inference/inference/agent/prompts.py b/ARC3-Inference/inference/agent/prompts.py
-index 52351db..3053e65 100644
+index 2e59574..fd749e9 100644
 --- a/ARC3-Inference/inference/agent/prompts.py
 +++ b/ARC3-Inference/inference/agent/prompts.py
-@@ -130,7 +130,7 @@ GAMEPLAY_CHANGED_ADDENDUM = (
+@@ -37,7 +37,8 @@ VISUAL_GAME_ADDENDUM = (
  STRUCTURED_RUNTIME_STATE_ADDENDUM = (
      "\n\nRuntime variables inside every `python` tool call:\n"
      "- `current_frame` is a lightweight frame view for the latest environment state.\n"
 -    "- `current_frame` exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.\n"
-+    "- `current_frame` exposes `.ascii`, `.step`, `.level`, `.shape`, `.grid`, and `.segmentation`.\n"
++    "- `current_frame` exposes `.ascii`, `.grid`, `.step`, `.level`, `.shape`, `.segmentation`, and `.memory`.\n"
++    "- `current_frame.grid` is the exact numeric color grid as an immutable tuple of row tuples, indexed `grid[row][col]`. Use it for precise cell/color tests and for `current_frame.memory.hash_grid(...)`.\n"
      "- `current_frame.ascii` is a single newline-delimited string containing the latest board rendered with the letter-coded ARC color symbols.\n"
      "- `current_frame.segmentation` parses the board into objects. It returns `{'nodes': [...], 'adjacency_list': [...]}`.\n"
-     "- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores position AND rotation -- equal hashes indicate matching color and shape up to rotation; they do not establish object identity), `rotation` (degrees clockwise from the object's canonical orientation: 0/90/180/270, reduced to 0/90 for 2-fold symmetric shapes, `None` for fully symmetric ones), `rotational_symmetry` (1, 2, or 4), `pose_hash` (the rotation-SENSITIVE variant, if you need to match exact orientation), `shape_hash` (color-independent pose shape signature), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]` cell coordinates), and `children` (ids of objects fully enclosed by this one).\n"
-@@ -139,12 +139,12 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
+     "- Each node in `segmentation['nodes']` is one 4-connected same-color object with: `id` (index, ordered top-most-left-most), `color` (ARC color character), `hash` (a signature of the object's color and shape that ignores its position -- equal hashes mean the same object regardless of where it is, so use it to track an object across frames or to spot multiple identical objects in one frame), `pixels` (cell count), `boundary` (clockwise outer-perimeter corner points as `[row, col]`), and `children` (ids of objects fully enclosed by this one).\n"
+@@ -46,7 +47,7 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
      "- `current_frame.step` is the current environment step count.\n"
      "- `current_frame.level` is the current level number.\n"
      "- `current_frame.shape` is a `(rows, cols)` tuple.\n"
 -    "- The raw numeric grid is intentionally not exposed. Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
-+    "- `current_frame.grid` is the exact numeric color grid, indexed as `grid[row][col]`, returned as an immutable tuple of row tuples. Use it for exact cell/color tests and custom scans; use `current_frame.segmentation` for object summaries and relationships, and `.ascii` for small human-readable regions. Prefer compact computed results over printing the whole grid.\n"
++    "- Use `current_frame.segmentation` as your primary view of the board -- objects, colors, shapes, containment, adjacency, and cross-frame object hashes. Use `current_frame.grid` for exact numeric checks. Use `current_frame.ascii` only to read a small, specific region; do not scan the whole board with it.\n"
  
      "- `history` is a chronological list of action/frame snapshots.\n"
      "- `history` is a Python list of objects, not a dict.\n"
-     "- Each history entry exposes `.action`, `.frame`, and `.result`; entries are not subscriptable like `entry['action']`.\n"
--    "- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes only `.ascii`, `.step`, `.level`, `.shape`, and `.segmentation`.\n"
-+    "- Each `history[i].frame` is the frame after `history[i].action`; each frame exposes `.ascii`, `.step`, `.level`, `.shape`, `.grid`, and `.segmentation`.\n"
-     "- Important history semantics: when `history` is non-empty, `history[-1].frame` is the same latest/post-action board as `current_frame`. It is not the previous board. To inspect the state before the latest action, use `previous_frame` or `history[-2].frame` when available.\n"
-     "- `previous_frame` is the frame before the most recent real environment action, or `None` if no previous frame is available.\n"
-     "- `last_action` is the most recent real environment action name/display, or `None` before any real action.\n"
+@@ -66,6 +67,19 @@ STRUCTURED_RUNTIME_STATE_ADDENDUM = (
+     "- After `action(actions)` returns, `current_frame`, `previous_frame`, `history`, `transitions`, `valid_actions`, and `last_action_result` are refreshed.\n"
+ )
+ 
++EPISODIC_MEMORY_ADDENDUM = (
++    "\n\nEpisodic memory (deterministic, host-side, survives every tool call):\n"
++    "- `current_frame.memory` is a `MemoryView` over every transition this run has actually executed. It is rebuilt from the host after each action, so it persists across `python` calls.\n"
++    "- `current_frame.memory.hash_grid(current_frame.grid)` returns the 64-bit state hash for the current board. The current level is mixed in automatically; pass a level explicitly only if you need another one.\n"
++    "- `current_frame.memory.tried(h)` lists the actions already executed from state `h` as dicts with `action`, `next`, `outcome`, and `count`. Outcomes are `active`, `progress`, `no_op`, `loop`, and `dead_end`.\n"
++    "- `current_frame.memory.is_pruned(h, action)` is `True` when that action is a known `no_op`, `dead_end`, or `loop` from state `h`.\n"
++    "- `current_frame.memory.safe_actions(h, valid_actions)` filters a candidate list down to actions that are not pruned.\n"
++    "- The gate is enforced in code, not prose: `action(...)` refuses a pruned action and returns `stop_reason='k5_pruned'` with the blocked actions, the transitions already recorded from this state, and the safe alternatives. Choose from `safe_actions` and continue in the same tool call.\n"
++    "- If every valid action is pruned, the gate stands down and lets the action through, so a level can never brick.\n"
++    "- Read memory before choosing: `h = current_frame.memory.hash_grid(current_frame.grid); print(current_frame.memory.tried(h))`.\n"
++)
++
++
+ MULTIMODAL_CONTEXT_ADDENDUM = (
+     "\n\nMultimodal context:\n"
+     "- User turns include an attached image of the current ARC grid.\n"
 diff --git a/ARC3-Inference/inference/agent/python_tool_sandbox.py b/ARC3-Inference/inference/agent/python_tool_sandbox.py
-index 58a94b3..71f7172 100644
+index ac24747..cf3b6a8 100644
 --- a/ARC3-Inference/inference/agent/python_tool_sandbox.py
 +++ b/ARC3-Inference/inference/agent/python_tool_sandbox.py
-@@ -164,8 +164,16 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+@@ -131,7 +131,16 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
              self.level = level
              self.shape = tuple(shape)
              self._grid = grid
 +            self._grid_view = None
              self._segmentation = None
- 
++            self.memory = None
++
 +        @property
 +        def grid(self):
-+            # Cache an immutable snapshot so callers cannot mutate the frame.
++            # Immutable numeric colour grid; cached so callers cannot mutate it.
 +            if self._grid_view is None:
 +                self._grid_view = tuple(tuple(row) for row in self._grid)
 +            return self._grid_view
-+
+ 
          @property
          def segmentation(self):
-             if self._segmentation is None:
-@@ -174,7 +182,7 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
- 
-         def __str__(self):
-             rows, cols = self.shape
--            return f"AsciiFrameView(level={self.level}, step={self.step}, shape={rows}x{cols})"
-+            return f"FrameView(level={self.level}, step={self.step}, shape={rows}x{cols})"
- 
+@@ -146,6 +155,109 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
          __repr__ = __str__
  
+ 
++    _FNV_OFFSET = 0xCBF29CE484222325
++    _FNV_PRIME = 0x100000001B3
++    _MASK64 = 0xFFFFFFFFFFFFFFFF
++    _ROW_SALT = 0x2C
++    _LEVEL_SALT = 0x9E3779B97F4A7C15
++    _PRUNED_OUTCOMES = ("no_op", "dead_end", "loop")
++
++    def _mix(h, byte):
++        h ^= byte & 0xFF
++        return (h * _FNV_PRIME) & _MASK64
++
++    def _grid_hash(grid, level=0):
++        h = (_FNV_OFFSET ^ ((int(level) & 0xFFFF) * _LEVEL_SALT)) & _MASK64
++        for row in grid or ():
++            for cell in row:
++                try:
++                    value = int(cell)
++                except (TypeError, ValueError):
++                    value = 0
++                h = _mix(h, value)
++            h = _mix(h, _ROW_SALT)
++        return h
++
++    def _num_text(value):
++        try:
++            return str(int(value))
++        except (TypeError, ValueError):
++            return str(value).strip()
++
++    def _action_key(action):
++        if isinstance(action, dict):
++            name = str(action.get("action", "") or "").strip().upper()
++            parts = [name or "?"]
++            if action.get("row") is not None:
++                parts.append("R%s" % _num_text(action.get("row")))
++            if action.get("col") is not None:
++                parts.append("C%s" % _num_text(action.get("col")))
++            return "|".join(parts)
++        return str(action or "").strip().upper()
++
++    def _hash_key(value):
++        if isinstance(value, bool):
++            return str(int(value))
++        if isinstance(value, int):
++            return "%016x" % (value & _MASK64)
++        return str(value or "").strip().lower()
++
++
++    class MemoryView:
++        # Read-only view of the host-side episodic memory for this run.
++        # (No docstring: this block lives inside the sandbox bootstrap text.)
++        def __init__(self, payload, level=0):
++            payload = payload if isinstance(payload, dict) else {}
++            self.version = int(payload.get("version", 0) or 0)
++            self.stats = dict(payload.get("stats") or {})
++            self._level = int(level or 0)
++            self._states = {}
++            for key, rows in (payload.get("states") or {}).items():
++                entries = {}
++                for row in rows or []:
++                    if not isinstance(row, (list, tuple)) or len(row) < 3:
++                        continue
++                    entries[str(row[0])] = (
++                        str(row[1]),
++                        str(row[2]),
++                        int(row[3]) if len(row) > 3 else 1,
++                    )
++                self._states[str(key)] = entries
++            self._dead = set(str(item) for item in (payload.get("dead_ends") or []))
++
++        def hash_grid(self, grid, level=None):
++            return _grid_hash(grid, self._level if level is None else level)
++
++        def tried(self, state_hash):
++            entries = self._states.get(_hash_key(state_hash), {})
++            return [
++                {"action": name, "next": record[0], "outcome": record[1], "count": record[2]}
++                for name, record in entries.items()
++            ]
++
++        def is_pruned(self, state_hash, action):
++            key = _hash_key(state_hash)
++            record = self._states.get(key, {}).get(_action_key(action))
++            if record is None:
++                return False
++            if record[1] in _PRUNED_OUTCOMES:
++                return True
++            if record[0] in self._dead:
++                return True
++            return record[0] == key
++
++        def safe_actions(self, state_hash, valid_actions):
++            return [a for a in (valid_actions or []) if not self.is_pruned(state_hash, a)]
++
++        def __len__(self):
++            return sum(len(entries) for entries in self._states.values())
++
++        def __str__(self):
++            return "MemoryView(states=%d, edges=%d)" % (len(self._states), len(self))
++
++        __repr__ = __str__
++
++
+     class HistoryEntryView:
+         def __init__(self, *, action, frame):
+             self.action = action
+@@ -352,6 +464,15 @@ _SANDBOX_BOOTSTRAP = textwrap.dedent(
+             runtime_globals["last_action"] = last_transition.action if last_transition is not None else None
+             runtime_globals["valid_actions"] = [str(item) for item in state_payload.get("valid_actions", [])]
+             runtime_globals["last_action_result"] = action_result
++            memory_payload = state_payload.get("memory")
++            memory_view = (
++                MemoryView(memory_payload, current_frame.level)
++                if isinstance(memory_payload, dict) and current_frame is not None
++                else None
++            )
++            if current_frame is not None:
++                current_frame.memory = memory_view
++            runtime_globals["memory"] = memory_view
+ 
+         def action(actions):
+             normalized_actions = _normalize_actions(actions)
 diff --git a/ARC3-Inference/inference/agent/tool_agent.py b/ARC3-Inference/inference/agent/tool_agent.py
-index 84a9cdd..6b21669 100644
+index 59655e9..bb3a5a6 100644
 --- a/ARC3-Inference/inference/agent/tool_agent.py
 +++ b/ARC3-Inference/inference/agent/tool_agent.py
-@@ -295,16 +295,16 @@ _DIFF_IMAGE = _get_env_bool("ARC3_DIFF_IMAGE", False)
- _RESPONSE_META_MAX_CHARS = 4000
+@@ -19,6 +19,7 @@ from inference.agent.prompts import (
+     GAME_OVERVIEW_ADDENDUM,
+     PYTHON_ADDENDUM,
+     STRUCTURED_RUNTIME_STATE_ADDENDUM,
++    EPISODIC_MEMORY_ADDENDUM,
+     MULTIMODAL_CONTEXT_ADDENDUM,
+     TOOL_CALL_FORMAT_GUIDANCE,
+     VISUAL_GAME_ADDENDUM,
+@@ -31,6 +32,11 @@ from inference.agent.vision_context import (
  
- _PYTHON_TOOL_DESCRIPTION = (
--    "Run one ephemeral Python snippet against preloaded ASCII game state. Available globals: "
-+    "Run one ephemeral Python snippet against preloaded board state. Available globals: "
-     "`current_frame`, `previous_frame`, `history`, `transitions`, `last_transition`, "
-     "`valid_actions`, `last_action_call_result`, "
-     "and `action(actions)` for executing one or more real environment actions. "
--    "`current_frame` and each `history[*].frame` expose only `.ascii`, `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
-+    "`current_frame` and each `history[*].frame` expose `.ascii`, `.grid` (an immutable tuple of numeric color IDs by row and column), `.segmentation`, `.step`, `.level`, and `.shape` (a `(rows, cols)` tuple); "
-     "`history[-1].frame` is the current post-action frame, not the previous frame. "
-     "For before/after diffs, compare `previous_frame` to `current_frame` or use `last_transition.before_frame` and `.after_frame`. "
-     "For MOUSE, pass `row` and `col` integer fields; legacy x/y fields are rejected. "
--    "The raw numeric grid is not available. Use `.segmentation` as the primary view; use `.ascii` only to read a small, specific region. "
--    "Use `print(...)` for compact output or assign final data to `result`."
-+    "Use `.grid` for exact cell-level tests, `.segmentation` for object summaries, and `.ascii` for small human-readable regions. "
-+    "Use `print(...)` for compact output or assign final data to `result`; avoid printing the whole grid when a summary will do."
- )
+ from inference.agent.python_tool_sandbox import run_sandboxed_python
+ from inference.agent.runtime_state import Frame, HistoryEntry, RUNTIME_STATE_FILENAME, load_runtime_state
++from inference.agent.episodic_memory import (
++    CompactStateGraph,
++    EPISODIC_MEMORY_GATE,
++    MEMORY_FILENAME,
++)
+ from inference.utils.openai_compat import build_chat_payload, build_headers
  
- def _normalize_valid_actions(valid_actions: list[str] | None) -> list[str]:
+ log = logging.getLogger(__name__)
+@@ -351,6 +357,7 @@ def _build_system_prompt(*, tool_output_tokens: int) -> str:
+     prompt = "You are a coding agent solving a grid-based puzzle game."
+     prompt += GAME_OVERVIEW_ADDENDUM
+     prompt += STRUCTURED_RUNTIME_STATE_ADDENDUM
++    prompt += EPISODIC_MEMORY_ADDENDUM
+     if current_grid_image_enabled():
+         prompt += MULTIMODAL_CONTEXT_ADDENDUM
+     prompt += VISUAL_GAME_ADDENDUM
+@@ -955,6 +962,8 @@ class ToolAgent:
+         self._last_step_summary: dict[str, Any] | None = None
+         self._last_action_result: dict[str, Any] | None = None
+         self._summarized_knowledge = _empty_world_model()
++        self._memory = CompactStateGraph()
++        self._memory_path: Path | None = None
+ 
+     def _headers(self) -> dict[str, str]:
+         api_key = (
+@@ -982,6 +991,8 @@ class ToolAgent:
+             self._last_step_summary = None
+             self._last_action_result = None
+             self._summarized_knowledge = _empty_world_model()
++            self._memory_path = runtime_dir / MEMORY_FILENAME
++            self._memory = CompactStateGraph.load(self._memory_path)
+ 
+     @property
+     def total_tokens(self) -> int:
+@@ -1488,6 +1499,7 @@ class ToolAgent:
+                     if isinstance(persisted_action_result, dict)
+                     else {}
+                 ),
++                "memory": self._memory.to_payload(),
+             }
+ 
+         terminal_action_result: dict[str, Any] | None = None
+@@ -1526,10 +1538,74 @@ class ToolAgent:
+                         last_action_result=compact_payload,
+                     ),
+                 }
++            before_frame = load_runtime_state(state_path)[0]
++            if EPISODIC_MEMORY_GATE and before_frame is not None and valid_actions:
++                refusal_gate = self._memory.gate(
++                    before_frame.grid,
++                    before_frame.level,
++                    normalized_actions,
++                    valid_actions,
++                )
++                if refusal_gate is not None:
++                    blocked_text = ", ".join(str(item) for item in refusal_gate["blocked"])
++                    tried_text = "; ".join(
++                        "%s->%s" % (item["action"], item["outcome"])
++                        for item in refusal_gate["tried"]
++                    ) or "none"
++                    stop_detail = (
++                        "Episodic memory pruned %s: from this exact board state those actions "
++                        "are known no-ops, dead ends, or loops. Safe actions now: %s. "
++                        "Transitions already recorded from this state: %s. "
++                        "Pick from safe_actions and continue in this same tool call."
++                        % (blocked_text, ", ".join(str(a) for a in refusal_gate["safe_actions"]) or "none", tried_text)
++                    )
++                    gate_result = {
++                        "executed": False,
++                        "action_num": (self._last_action_result or {}).get("action_num"),
++                        "level": before_frame.level,
++                        "score": (self._last_action_result or {}).get("score"),
++                        "reward": 0.0,
++                        "state": (self._last_action_result or {}).get("state"),
++                        "valid_actions": list(valid_actions),
++                        "board_changed": False,
++                        "done": False,
++                        "level_completed": False,
++                        "game_over": False,
++                        "run_complete": False,
++                        "requested_count": len(normalized_actions),
++                        "executed_count": 0,
++                        "stopped_early": True,
++                        "stop_reason": "k5_pruned",
++                        "stop_detail": stop_detail,
++                        "k5_pruned": {
++                            "blocked": list(refusal_gate["blocked"]),
++                            "safe_actions": list(refusal_gate["safe_actions"]),
++                            "tried": list(refusal_gate["tried"]),
++                        },
++                    }
++                    self._last_action_result = dict(gate_result)
++                    return {
++                        "action_result": gate_result,
++                        "state": _serialized_runtime_state(
++                            next_valid_actions=valid_actions,
++                            last_action_result=gate_result,
++                        ),
++                    }
++
+             raw_payload = self._step_env_callback({"actions": normalized_actions})
+             if not isinstance(raw_payload, dict):
+                 raise RuntimeError("action(actions) did not return a JSON-like payload.")
+             compact_payload = self._compact_action_result(raw_payload)
++            if len(normalized_actions) == 1 and compact_payload.get("executed"):
++                after_frame = load_runtime_state(state_path)[0]
++                if before_frame is not None and after_frame is not None:
++                    self._memory.observe(
++                        before_frame,
++                        normalized_actions[0],
++                        compact_payload,
++                        after_frame,
++                    )
++                    self._memory.save(self._memory_path)
+             next_valid_actions = raw_payload.get("valid_actions")
+             if isinstance(next_valid_actions, list):
+                 self._current_valid_actions = _normalize_valid_actions(next_valid_actions)

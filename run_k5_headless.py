@@ -41,17 +41,26 @@ def main() -> None:
     verify_credentials()
     repo_root = Path(__file__).resolve().parent
     k5_dir = repo_root / "kaggle5"
+    variant = os.environ.get("K5_VARIANT", "lever3").strip() or "lever3"
+    if variant not in ("lever3", "kernel"):
+        sys.stderr.write("ERROR: K5_VARIANT must be 'lever3' or 'kernel', got %r\n"
+                         % variant)
+        sys.exit(1)
 
     print("=== Step 1: Pre-flight Self-Test ===")
     self_test_out = run_command([sys.executable, "kaggle5.py", "--self-test"], cwd=k5_dir)
     print(self_test_out.strip())
 
-    print("\n=== Step 2: Executing Headless Push Stage ===")
-    push_out = run_command([sys.executable, "kaggle5.py", "--stage", "push"], cwd=k5_dir)
+    print("\n=== Step 2: Executing Headless Push Stage (variant=%s) ===" % variant)
+    push_out = run_command(
+        [sys.executable, "kaggle5.py", "--stage", "push", "--variant", variant],
+        cwd=k5_dir,
+    )
     print(push_out.strip())
 
     print("\n" + "=" * 66)
     print("PUSH COMPLETE — MACHINE HALTED. THE MACHINE NEVER AUTO-SUBMITS.")
+    print("variant pushed: %s" % variant)
     print("=" * 66)
     print("Mobile Finalization Instructions:")
     print("1. Open the Kaggle Mobile App.")

@@ -25,7 +25,9 @@ kaggle5/
 ├── k5_gym.py                     FROZEN lineage: local toy filter gym. Never
 │                                 runs in v5 (harness has no local proxy).
 ├── lever2-grid.patch             THE LEVER. Pinned fixed artifact (sha256).
-├── lever2_apply.py               applier (applies and hash-verifies all 4 hunks).
+│                                 Carries lever-2 (.grid) AND lever-3 (memory).
+├── lever3_apply.py               applier (applies + hash-verifies 5 files,
+│                                 then proves the capabilities are live).
 ├── build_notebook.py             notebook generator (preflight self-test gates build).
 ├── 4CBOn2_Kaggle5.ipynb          generated deliverable to import into Kaggle.
 └── _stub_kaggle.py               Kaggle CLI test double for offline tests.
@@ -87,8 +89,46 @@ Backtrack rule: WORSE reverts and kills that knob's ladder; EQUAL adopts and con
 - **Sanitizer**: Runs at every push (loud): removes hand lever-2 prototype cells
   (inline monkeypatch edits) and empty output-less code cells; the canonical
   hash-verified lever pair replaces them. Lever pair = `%%writefile lever2-grid.patch`
-  cell + applier cell (`lever2_apply.py` applies and hash-verifies all 4 hunks;
-  patch pinned sha256 `143ae716d99374cccbe6f25b607c3f6bf6e2eb9fa50299b9a05ff5e3cfd09b69`).
+  cell + applier cell (`lever3_apply.py` applies and hash-verifies all 5 files;
+  patch pinned sha256 `eb25c2d6480ed36eba40e9a05bc358ac2d59995856604d0023d0d67f62bb2cc9`).
+
+
+## Lever-3 — deterministic episodic memory (in the sandbox, on the host)
+
+The previous 48.87% local score was concentrated on games present in the
+pre-caching bundle; the public 25.15 was the memorization gap. An LLM without
+state memory repeats dead-end moves. Lever-3 fixes that **in the harness**, not
+by prompting harder:
+
+- `inference/agent/episodic_memory.py` — `CompactStateGraph` on the host, next
+  to `tool_runtime_state.json`. FNV-1a 64-bit hashes of `current_frame.grid`,
+  level-salted; edges `(h(S_t), a_t) -> h(S_t+1)` labelled
+  `active | progress | no_op | loop | dead_end`. Bounded, JSON-serialisable,
+  persisted to `tool_episodic_memory.json`, reloaded per game.
+- **Why the host:** `run_sandboxed_python` starts a *fresh subprocess for every
+  `python` tool call*. Anything created inside it dies with the call, so
+  in-sandbox memory cannot be episodic. The host sees every real `action(...)`
+  transition and survives.
+- `python_tool_sandbox.py` — a read-only `MemoryView` is rebuilt into the
+  sandbox each call and exposed as `current_frame.memory` and `memory`.
+- `tool_agent.py` — records every single-action transition and **enforces** the
+  gate: `action(...)` refuses a known `no_op` / `dead_end` / `loop` and returns
+  `stop_reason='k5_pruned'` with the blocked actions, the recorded transitions,
+  and the safe alternatives. If every valid action is pruned the gate stands
+  down, so a level can never brick.
+- `prompts.py` — `EPISODIC_MEMORY_ADDENDUM` tells the model how to read memory
+  before choosing.
+
+**Variants (A/B).** `--variant lever3` is the default. `--variant kernel`
+applies the same bytes but sets `EPISODIC_MEMORY_GATE = False` and removes the
+prompt directives: memory stays readable, nothing is blocked. One dispatch
+input flips between them, so the next submission is a clean comparison.
+
+**Tested.** `lever3_apply.py` verifies post-image blob hashes and capability
+markers on every run. The local proof exercises the real `ToolAgent` and real
+sandbox subprocess: memory survives across tool calls, a repeated no-op is
+refused without reaching the environment, a safe action passes, a recorded dead
+end is refused across agent instances, and the kernel variant never blocks.
 
 ## Static Gate
 
