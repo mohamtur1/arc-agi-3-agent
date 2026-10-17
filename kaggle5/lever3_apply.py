@@ -17,11 +17,79 @@ from pathlib import Path
 
 VARIANT = "lever3"  # k5-variant-line
 
-WORKING_DIR = Path(os.environ.get("WORKING_DIR", "/kaggle/working"))
-BUNDLE_DIR = Path(os.environ.get("BUNDLE_DIR",
-                                 "/kaggle/working/taaf-kaggle-source-bundle"))
+AGENT_REL = Path("inference") / "agent" / "python_tool_sandbox.py"
+
+
+def _looks_like_src(path) -> bool:
+    try:
+        return bool(path) and (Path(path) / "ARC3-Inference" / AGENT_REL).is_file()
+    except OSError:
+        return False
+
+
+def _search_for_src(max_depth: int = 6):
+    """Find the bundle's src/ by looking for the harness itself."""
+    import os as _os
+    roots = ["/kaggle/working", "/kaggle/temp", _os.getcwd()]
+    skip = {"__pycache__", ".git", "node_modules", ".ipynb_checkpoints"}
+    for root in roots:
+        if not _os.path.isdir(root):
+            continue
+        base_depth = root.rstrip("/").count("/")
+        for dirpath, dirnames, _ in _os.walk(root):
+            if dirpath.count("/") - base_depth >= max_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d not in skip]
+            if "python_tool_sandbox.py" in _os.listdir(dirpath):
+                # <src>/ARC3-Inference/inference/agent/python_tool_sandbox.py
+                # <src>/ARC3-Inference/inference/agent -> parents[2] is <src>
+                src = Path(dirpath).parents[2] if len(Path(dirpath).parts) > 2 else None
+                if _looks_like_src(src):
+                    return src
+    return None
+
+
+def _resolve_src():
+    """Three tiers, because this cell runs inside the notebook namespace.
+
+    The kernel's own setup cell defines a Python global BUNDLE_DIR. Reading
+    only the ENVIRONMENT variable was the bug: the global exists, the env var
+    does not, so the applier fell back to a hard-coded guess and died. A cell
+    sees globals first; a standalone run has to fall back to env, then to a
+    filesystem search.
+    """
+    seen = []
+    g = globals().get("BUNDLE_DIR")
+    if g is not None:
+        seen.append(("kernel global BUNDLE_DIR", Path(g)))
+    if os.environ.get("BUNDLE_DIR"):
+        seen.append(("env BUNDLE_DIR", Path(os.environ["BUNDLE_DIR"])))
+    seen.append(("default", Path("/kaggle/working/taaf-kaggle-source-bundle")))
+    for label, base in seen:
+        for candidate in (base / "src", base):
+            if _looks_like_src(candidate):
+                print("lever 3: harness located via %s -> %s" % (label, candidate))
+                return candidate
+    found = _search_for_src()
+    if found is not None:
+        print("lever 3: harness located by filesystem search -> %s" % found)
+        return found
+    raise FileNotFoundError(
+        "lever 3 FAILED: could not find the harness bundle. Looked at "
+        "kernel global BUNDLE_DIR=%r, env BUNDLE_DIR=%r, the default path, "
+        "and a bounded search of /kaggle/working, /kaggle/temp and cwd for "
+        "ARC3-Inference/inference/agent/python_tool_sandbox.py. Run this cell "
+        "after the kernel's setup cell that defines BUNDLE_DIR."
+        % (globals().get("BUNDLE_DIR"), os.environ.get("BUNDLE_DIR")))
+
+
+WORKING_DIR = Path(globals().get("WORKING_DIR")
+                   or os.environ.get("WORKING_DIR") or "/kaggle/working")
+if not WORKING_DIR.is_dir():
+    WORKING_DIR = Path("/kaggle/working")
 PATCH = WORKING_DIR / "lever2-grid.patch"
-SRC = BUNDLE_DIR / "src"
+SRC = _resolve_src()
 AGENT = SRC / "ARC3-Inference" / "inference" / "agent"
 
 # Post-image git blob hashes taken from the patch's own index lines.
@@ -65,7 +133,8 @@ def core_present() -> bool:
 
 
 if not SRC.is_dir():
-    raise FileNotFoundError("run the section 1 setup cell first: " + str(SRC))
+    raise FileNotFoundError("lever 3 FAILED: resolved src is not a directory: "
+                            + str(SRC))
 if not PATCH.is_file():
     raise FileNotFoundError("run the 4b-1 cell first: " + str(PATCH))
 
@@ -88,6 +157,19 @@ else:
     if bad:
         raise RuntimeError("lever 3 FAILED hash check: " + ", ".join(bad))
     print("lever 3: applied and hash-verified (%d files)" % len(POST))
+
+# Ordering guard: editing files after the harness is imported changes nothing.
+import sys as _sys
+_loaded = [m for m in ("inference.agent.tool_agent",
+                       "inference.agent.python_tool_sandbox",
+                       "inference.agent.prompts") if m in _sys.modules]
+if _loaded:
+    print("lever 3: WARNING the harness was ALREADY IMPORTED before this cell "
+          "(%s). File edits cannot change a loaded module, so this run may not "
+          "see Lever-3. Move the lever cells above the harness import."
+          % ", ".join(_loaded))
+else:
+    print("lever 3: ordering OK (harness not imported yet, patched files will load)")
 
 # Capability proof: the patch must be live, not merely present.
 missing = []
