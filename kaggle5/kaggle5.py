@@ -99,6 +99,10 @@ REQUIRED_UPSTREAM_NAMES = ("WORKING_DIR", "BUNDLE_DIR")
 # Only used when machine_shape comes back empty. Verified value, taken from the
 # notebook's own metadata. The CLI docs write it NvidiaRtxPro6000.
 FALLBACK_ACCELERATOR = "nvidiaRtxPro6000"
+# The accelerator this project measures on. Pinned in the pushed metadata so a
+# stray UI change (e.g. a temporary T4 for a smoke test) cannot silently become
+# the hardware every later version inherits.
+TARGET_ACCELERATOR = os.environ.get("K5_ACCELERATOR", "nvidiaRtxPro6000")
 
 # The 5 inputs. push refuses if any is missing.
 EXPECTED_COMPETITION_SOURCES = ["arc-prize-2026-arc-agi-3"]
@@ -1677,6 +1681,21 @@ def do_push(work: Path, patch_path: Path, applier_path: Path,
 
     code.write_text(json.dumps(nb2, indent=1))
     say("  wrote %s (%d cells)" % (code.name, len(nb2["cells"])))
+
+    # Pin the accelerator. A version saved with a different machine is sticky:
+    # every later pull inherits it, so a temporary change becomes permanent
+    # without anyone noticing until the VRAM line says 0.0/15.0.
+    pulled = (meta.get("machine_shape") or "").strip()
+    if pulled != TARGET_ACCELERATOR:
+        say("  ACCELERATOR DRIFT: pulled machine_shape=%r, pinning to %r"
+            % (pulled or "(empty)", TARGET_ACCELERATOR))
+        meta["machine_shape"] = TARGET_ACCELERATOR
+        meta["enable_gpu"] = True
+        (work / "kernel-metadata.json").write_text(
+            json.dumps(meta, indent=2), encoding="utf-8")
+        say("  wrote kernel-metadata.json with machine_shape=%s" % TARGET_ACCELERATOR)
+    else:
+        say("  accelerator pinned: %s" % TARGET_ACCELERATOR)
 
     args = ["kernels", "push", "-p", str(work)]
     if needs_accelerator_flag(meta):
