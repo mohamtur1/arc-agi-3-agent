@@ -42,6 +42,26 @@ def describe_secret(value: str) -> str:
     return "%d chars, unrecognised shape" % len(value)
 
 
+def normalize_credentials() -> None:
+    """Put each credential where the Kaggle CLI actually looks for it.
+
+    Kaggle now hands out KGAT_... access tokens, and CLI 2.x reads those from
+    KAGGLE_API_TOKEN -- not from KAGGLE_KEY, which stays a legacy 32-hex pair.
+    A KGAT token saved in KAGGLE_KEY is present, well-formed, and rejected at
+    the API call, which reads like a broken key rather than a misplaced one.
+    """
+    key = os.environ.get("KAGGLE_KEY", "").strip()
+    token = os.environ.get("KAGGLE_API_TOKEN", "").strip()
+    if key.startswith("KGAT_") and not token:
+        os.environ["KAGGLE_API_TOKEN"] = key
+        print("  KAGGLE_KEY holds a KGAT access token -> using it as "
+              "KAGGLE_API_TOKEN (CLI 2.x reads that name)")
+    elif token.startswith("KGAT_") and not key:
+        print("  KAGGLE_API_TOKEN holds the KGAT access token (as intended)")
+    elif key and not key.startswith("KGAT_") and not token:
+        print("  using the legacy KAGGLE_USERNAME/KAGGLE_KEY pair")
+
+
 def probe_auth() -> None:
     """Prove the Kaggle CLI accepts these credentials, not just that they exist.
 
@@ -96,6 +116,7 @@ def run_command(cmd: list[str], cwd: Path) -> str:
 
 def main() -> None:
     verify_credentials()
+    normalize_credentials()
     probe_auth()
     repo_root = Path(__file__).resolve().parent
     k5_dir = repo_root / "kaggle5"
