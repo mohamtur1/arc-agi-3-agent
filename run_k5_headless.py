@@ -130,11 +130,14 @@ def main() -> None:
     self_test_out = run_command([sys.executable, "kaggle5.py", "--self-test"], cwd=k5_dir)
     print(self_test_out.strip())
 
+    allow_same = os.environ.get("K5_ALLOW_SAME", "").strip().lower() in ("1", "true", "yes")
+    cmd = [sys.executable, "kaggle5.py", "--stage", "push", "--variant", variant]
+    if allow_same:
+        cmd.append("--allow-same")
+        print("\nnote: allow_same=true — pushing even though the injected notebook")
+        print("      matches the current kernel (e.g. after a hardware change).")
     print("\n=== Step 2: Executing Headless Push Stage (variant=%s) ===" % variant)
-    push_out = run_command(
-        [sys.executable, "kaggle5.py", "--stage", "push", "--variant", variant],
-        cwd=k5_dir,
-    )
+    push_out = run_command(cmd, cwd=k5_dir)
     print(push_out.strip())
 
     print("\n" + "=" * 66)

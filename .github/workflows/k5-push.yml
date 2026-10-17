@@ -13,6 +13,11 @@ on:
         options:
           - lever3
           - kernel
+      allow_same:
+        description: 'Force a new version even if the code is unchanged'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   headless-push:
@@ -37,5 +42,6 @@ jobs:
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           K5_VARIANT: ${{ github.event.inputs.variant || 'lever3' }}
+          K5_ALLOW_SAME: ${{ github.event.inputs.allow_same || 'false' }}
         run: |
           python run_k5_headless.py
