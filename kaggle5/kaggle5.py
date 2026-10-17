@@ -1691,6 +1691,10 @@ def do_push(work: Path, patch_path: Path, applier_path: Path,
             % (pulled or "(empty)", TARGET_ACCELERATOR))
         meta["machine_shape"] = TARGET_ACCELERATOR
         meta["enable_gpu"] = True
+        # Belt and braces: newer kaggle-api reads "accelerator" while older
+        # builds read "machine_shape". Writing both means neither schema can
+        # quietly keep the previous machine.
+        meta["accelerator"] = TARGET_ACCELERATOR
         (work / "kernel-metadata.json").write_text(
             json.dumps(meta, indent=2), encoding="utf-8")
         say("  wrote kernel-metadata.json with machine_shape=%s" % TARGET_ACCELERATOR)
@@ -1698,10 +1702,11 @@ def do_push(work: Path, patch_path: Path, applier_path: Path,
         say("  accelerator pinned: %s" % TARGET_ACCELERATOR)
 
     args = ["kernels", "push", "-p", str(work)]
-    if needs_accelerator_flag(meta):
-        say("  machine_shape empty on the pulled metadata; passing --accelerator %s"
-            % FALLBACK_ACCELERATOR)
-        args += ["--accelerator", FALLBACK_ACCELERATOR]
+    # Always state the accelerator on the command line too. Passing it only
+    # when the field looked empty is how a T4 version became sticky: the field
+    # looked populated (with the wrong machine) and nothing ever corrected it.
+    args += ["--accelerator", TARGET_ACCELERATOR]
+    say("  push --accelerator %s" % TARGET_ACCELERATOR)
     out = kaggle(args, timeout=600).stdout
     return parse_push_version(out)
 
